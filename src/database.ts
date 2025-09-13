@@ -216,6 +216,19 @@ export class QuestDatabase {
     });
   }
 
+  async getQuestTemplateById(templateId: string): Promise<QuestTemplate | null> {
+    return new Promise((resolve, reject) => {
+      this.db.get(
+        `SELECT * FROM quest_templates WHERE id = ?`,
+        [templateId],
+        (err, row: QuestTemplate) => {
+          if (err) reject(err);
+          else resolve(row || null);
+        }
+      );
+    });
+  }
+
   // Active quest operations
   async createActiveQuest(userId: string, questTemplateId: string): Promise<ActiveQuest> {
     return new Promise((resolve, reject) => {

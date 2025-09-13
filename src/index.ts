@@ -400,8 +400,12 @@ class ExampleMentraOSApp extends AppServer {
         try {
           const activeQuest = await this.database.getUserActiveQuest(userId);
           if (activeQuest) {
-            // Award points and mark complete
-            const points = 100; // TODO: Get actual points from quest template
+            // Get the quest template to get the correct point value
+            const questTemplate = await this.database.getQuestTemplateById(
+              activeQuest.quest_template_id
+            );
+            const points = questTemplate?.points || 100; // Fallback to 100 if template not found
+
             await this.database.completeQuest(activeQuest.id, points);
 
             // Get updated user stats
@@ -409,7 +413,9 @@ class ExampleMentraOSApp extends AppServer {
 
             session.layouts.showReferenceCard(
               "🎉 Quest Completed!",
-              `Congratulations! You earned ${points} points!\n\n📊 Total Points: ${
+              `Congratulations! You earned ${points} points for completing "${
+                questTemplate?.title || "your quest"
+              }"!\n\n📊 Total Points: ${
                 user?.total_points || 0
               }\n🏆 Quests Completed: ${
                 user?.quests_completed || 0
@@ -419,6 +425,7 @@ class ExampleMentraOSApp extends AppServer {
 
             session.logger.info("Quest completed", {
               questId: activeQuest.id,
+              questTitle: questTemplate?.title,
               points,
               totalPoints: user?.total_points,
             });
@@ -461,6 +468,8 @@ class ExampleMentraOSApp extends AppServer {
 
         // Then handle regular transcription display
         displayTranscription(data.text);
+        // Handle quest commands first
+        await handleQuestCommands(data.text);
       }
     });
 
