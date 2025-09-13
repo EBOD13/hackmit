@@ -1,5 +1,6 @@
 import { ToolCall, AppSession } from '@mentra/sdk';
 
+// tool class are for the Mira built-in AI to call. don't think we need to deal with this yet.
 /**
  * Handle a tool call
  * @param toolCall - The tool call from the server
