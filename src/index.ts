@@ -1,7 +1,7 @@
 import { ToolCall, AppServer, AppSession } from '@mentra/sdk';
-import path from 'path';
-import { setupExpressRoutes } from './webview';
-import { handleToolCall } from './tools';
+import path from "path";
+import { setupExpressRoutes } from "./webview";
+import { handleToolCall } from "./tools";
 import { QuestDatabase, User, QuestTemplate, ActiveQuest } from "./database";
 import { GooglePlacesService, QuestLocation } from "./places-service";
 
@@ -147,16 +147,114 @@ class ExampleMentraOSApp extends AppServer {
   }
 
   /**
-   * Display a quest template to the user using MentraOS layouts
+   * Wrap text into a list of lines with a maximum line length (respecting newlines)
+   * @param text
    */
-  private displayQuestTemplate(
+  private wrapText(text: string, maxLineLength: number = 36): string[] {
+    const words = text.split(" ");
+    const lines: string[] = [];
+    let currentLine = "";
+    for (const word of words) {
+      if ((currentLine + word).length > maxLineLength || word.includes("\n")) {
+        lines.push(currentLine.trim());
+        currentLine = word + " ";
+      } else {
+        currentLine += word + " ";
+      }
+    }
+    lines.push(currentLine.trim());
+    return lines;
+  }
+
+  /**
+   * Display scrolling text for content that exceeds 5 lines
+   */
+  private async displayScrollingText(
     session: AppSession,
-    questTemplate: QuestTemplate
-  ): void {
-    session.layouts.showReferenceCard(
+    title: string,
+    content: string,
+    maxLinesPerScreen: number = 3,
+    scrollDelay: number = 2000
+  ): Promise<void> {
+    const lines = this.wrapText(content);
+    console.log("Wrapped lines:", lines.join("\n"));
+
+    // If content fits in one screen, show normally
+    if (lines.length <= maxLinesPerScreen) {
+      session.layouts.showReferenceCard(title, content, { durationMs: -1 });
+      return;
+    }
+
+    session.logger.info("Displaying scrolling text", {
+      totalLines: lines.length,
+      maxLinesPerScreen,
+      scrollDelay,
+    });
+
+    // Show initial screen first (lines 0-4)
+    let currentWindow = lines.slice(0, maxLinesPerScreen);
+    session.layouts.showReferenceCard(title, currentWindow.join("\n"), {
+      durationMs: scrollDelay * 1.5,
+    });
+
+    // Wait before starting to scroll
+    await new Promise((resolve) => setTimeout(resolve, scrollDelay));
+
+    // Scroll through the content one line at a time
+    const totalScrollPositions = lines.length - maxLinesPerScreen + 1;
+
+    for (let position = 1; position < totalScrollPositions; position++) {
+      const windowLines = lines.slice(position, position + maxLinesPerScreen);
+      const windowContent = windowLines.join("\n");
+
+      // Show this scroll position
+      const isLastPosition = position === totalScrollPositions - 1;
+      const displayDuration = isLastPosition
+        ? scrollDelay * 4
+        : scrollDelay * 1.5; // Last position stays up
+
+      session.layouts.showReferenceCard(title, windowContent, {
+        durationMs: displayDuration,
+      });
+
+      // Wait before scrolling to next position (except for last)
+      if (!isLastPosition) {
+        await new Promise((resolve) => setTimeout(resolve, scrollDelay));
+      }
+    }
+  }
+
+  /**
+   * Display a quest template to the user using MentraOS layouts with scrolling for long content
+   */
+  private async displayQuestTemplate(
+    session: AppSession,
+    questTemplate: QuestTemplate,
+    userLocation?: { lat: number; lng: number }
+  ): Promise<void> {
+    // Build quest content
+    let distanceInfo = "";
+    if (
+      userLocation &&
+      questTemplate.location_lat &&
+      questTemplate.location_lng
+    ) {
+      const distance = this.calculateDistance(
+        userLocation.lat,
+        userLocation.lng,
+        questTemplate.location_lat,
+        questTemplate.location_lng
+      );
+      distanceInfo = `\n📏 Distance: ${(distance * 1000).toFixed(0)}m away`;
+    }
+
+    const questContent = `${questTemplate.description}\n\n📍 Location: ${questTemplate.location_name}\n${questTemplate.location_address}${distanceInfo}\n\n🏆 Points: ${questTemplate.points}`;
+
+    // Use scrolling display for long content
+    await this.displayScrollingText(
+      session,
       `🎯 ${questTemplate.title}`,
-      `${questTemplate.description}\n\n📍 Location: ${questTemplate.location_name}\n${questTemplate.location_address}\n\n🏆 Points: ${questTemplate.points}`,
-      { durationMs: -1 }
+      questContent
     );
 
     session.logger.info("Quest displayed", {
@@ -315,28 +413,11 @@ class ExampleMentraOSApp extends AppServer {
               questTemplate
             );
             if (activeQuest) {
-              // Show distance if we have user location
-              let distanceInfo = "";
-              if (
-                userLocation &&
-                questTemplate.location_lat &&
-                questTemplate.location_lng
-              ) {
-                const distance = this.calculateDistance(
-                  userLocation.lat,
-                  userLocation.lng,
-                  questTemplate.location_lat,
-                  questTemplate.location_lng
-                );
-                distanceInfo = `\n📏 Distance: ${(distance * 1000).toFixed(
-                  0
-                )}m away`;
-              }
-
-              session.layouts.showReferenceCard(
-                `🎯 ${questTemplate.title}`,
-                `${questTemplate.description}\n\n📍 Location: ${questTemplate.location_name}\n${questTemplate.location_address}${distanceInfo}\n\n🏆 Points: ${questTemplate.points}`,
-                { durationMs: -1 }
+              // Display quest with scrolling support
+              await this.displayQuestTemplate(
+                session,
+                questTemplate,
+                userLocation || undefined
               );
 
               session.logger.info("Quest assigned", {
@@ -372,12 +453,21 @@ class ExampleMentraOSApp extends AppServer {
         try {
           const activeQuest = await this.database.getUserActiveQuest(userId);
           if (activeQuest) {
-            const questTemplate =
-              await this.database.getQuestTemplatesByCategory("", 1);
-            // Find the matching template (this is a simplified approach for MVP)
-            const template = await this.getRandomQuestTemplate(); // For now, just show any template
-            if (template) {
-              this.displayQuestTemplate(session, template);
+            // Get the actual quest template for the active quest
+            const questTemplate = await this.database.getQuestTemplateById(
+              activeQuest.quest_template_id
+            );
+            if (questTemplate) {
+              const userLocation = this.userLocationsMap.get(userId);
+              await this.displayQuestTemplate(
+                session,
+                questTemplate,
+                userLocation
+              );
+            } else {
+              session.layouts.showTextWall("Error loading quest details.", {
+                durationMs: 3000,
+              });
             }
           } else {
             session.layouts.showTextWall(
@@ -463,9 +553,6 @@ class ExampleMentraOSApp extends AppServer {
     // Listen for transcriptions
     session.events.onTranscription(async (data) => {
       if (data.isFinal) {
-        // Handle quest commands first
-        await handleQuestCommands(data.text);
-
         // Then handle regular transcription display
         displayTranscription(data.text);
         // Handle quest commands first
