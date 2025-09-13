@@ -1,64 +1,136 @@
-# MentraOS-Display-Example-App
+﻿# Quest HUD App - Social AR Quest Platform
 
-### Install MentraOS on your phone
+A prototype social HUD quest app built with Mentra OS SDK that allows users to complete real-world quests through AR overlays and voice commands.
 
-MentraOS install links: [mentra.glass/install](https://mentra.glass/install)
+## Features
 
-### (Easiest way to get started) Set up ngrok
+### Core Features
+- **Quest Management**: Create, assign, and complete photo-based, location-based, and action-based quests
+- **Voice Commands**: Accept/decline quests, view stats, and complete quests using voice
+- **Streak Tracking**: Track daily completion streaks and maintain leaderboards
+- **Social Elements**: Mock friends system and competitive leaderboards
 
-1. `brew install ngrok`
+### HUD/AR Features (Mentra OS Specific)
+- **AR Navigation**: Visual cues for location-based quests
+- **HUD Overlays**: Streak counters, quest prompts, and notifications
+- **Voice Integration**: Microphone support for hands-free interaction
+- **Real-time Updates**: Live quest status and completion feedback
 
-2. Make an ngrok account
+## Sample Quests
 
-3. [Use ngrok to make a static address/URL](https://dashboard.ngrok.com/)
+The app includes 5 preloaded sample quests:
 
-### Register your App with MentraOS
+1. **Ice Cream Adventure** (Action) - Order your favorite ice cream
+2. **Sunset Photo** (Photo) - Capture a beautiful sunset
+3. **Coffee Shop Visit** (Location) - Visit a local coffee shop
+4. **Park Walk** (Action) - Take a 10-minute walk in a park
+5. **Street Art Hunt** (Photo) - Find and photograph street art
 
-1. Navigate to [console.mentra.glass](https://console.mentra.glass/)
+## Voice Commands
 
-2. Click "Sign In", and log in with the same account you're using for MentraOS
+- `"Accept Quest"` / `"Decline Quest"` - Respond to quest prompts
+- `"Show Quests"` - View available quests
+- `"Show Streak"` - View your current streak and points
+- `"Show Leaderboard"` - View the top players
+- `"Take Photo"` - Complete photo-based quests
+- `"Mark Complete"` - Complete action-based quests
+- `"Help"` - Show all available commands
 
-3. Click "Create App"
+## Setup Instructions
 
-4. Set a unique package name like `com.yourName.yourAppName`
+### Prerequisites
+- Node.js and Bun installed
+- Mentra OS developer account
+- Mentra OS glasses or simulator
 
-5. For "Public URL", enter your Ngrok's static URL
+### Installation
 
-6. In the edit app screen, add the microphone permission
+1. **Clone and install dependencies:**
+   ```bash
+   git clone <repository-url>
+   cd hackmit
+   bun install
+   ```
 
-### Get your App running!
+2. **Set up environment variables:**
+   Create a `.env` file in the root directory:
+   ```env
+   PACKAGE_NAME=your-package-name
+   MENTRAOS_API_KEY=your-api-key
+   PORT=3000
+   ```
 
-1. [Install bun](https://bun.sh/docs/installation)
+3. **Get your API credentials:**
+   - Visit [Mentra OS Console](https://console.mentra.glass/)
+   - Create a new app and get your package name and API key
+   - Add them to your `.env` file
 
-2. Create a new repo from this template using the `Use this template` dropdown in the upper right or the following command: `gh repo create --template Mentra-Community/MentraOS-Cloud-Example-App`
+4. **Start the development server:**
+   ```bash
+   bun run dev
+   ```
 
-    ![Create repo from template](https://github.com/user-attachments/assets/c10e14e8-2dc5-4dfa-adac-dd334c1b73a5)
+5. **Test with Mentra OS:**
+   - Connect your Mentra OS glasses or use the simulator
+   - The app will automatically connect and show quest prompts
+   - Use voice commands to interact with the app
 
-3. Clone your new repo locally: `git clone <your-repo-url>`
+## Project Structure
 
-4. cd into your repo, then type `bun install`
+```
+src/
+ types/
+    index.ts          # TypeScript type definitions
+ components/           # HUD overlay components
+ quests/              # Quest management logic
+ services/            # Location and other services
+ utils/               # Utility functions
+ index.ts             # Main application entry point
+```
 
-5. Set up your environment variables:
-   * Create a `.env` file in the root directory by copying the example: `cp .env.example .env`
-   * Edit the `.env` file with your app details:
-     ```
-     PORT=3000
-     PACKAGE_NAME=com.yourName.yourAppName
-     MENTRAOS_API_KEY=your_api_key_from_console
-     ```
-   * Make sure the `PACKAGE_NAME` matches what you registered in the MentraOS Console
-   * Get your `API_KEY` from the MentraOS Developer Console
+## Technical Implementation
 
-6. Run your app with `bun run dev`
+### Quest System
+- **QuestManager**: Handles quest creation, assignment, and completion
+- **Quest Types**: Photo, Location, and Action-based quests
+- **Verification**: Location-based quests use GPS verification
+- **Rewards**: Point-based reward system with difficulty scaling
 
-7. To expose your app to the internet (and thus MentraOS) with ngrok, run: `ngrok http --url=<YOUR_NGROK_URL_HERE> 3000`
-    * `3000` is the port. It must match what is in the app config. For example, if you entered `port: 8080`, use `8080` for ngrok instead.
+### HUD Integration
+- **Mentra OS SDK**: Native AR overlay support
+- **View Types**: Different overlay positions (main, top-right, bottom-left, etc.)
+- **Real-time Updates**: Live quest status and notifications
+- **Voice Processing**: Real-time transcription and command handling
 
+### Social Features
+- **User Profiles**: Streak tracking, points, and level system
+- **Leaderboards**: Competitive ranking system
+- **Mock Friends**: Simulated social connections
 
-### Next Steps
+## Development Notes
 
-Check out the full documentation at [docs.mentra.glass](https://docs.mentra.glass/core-concepts)
+- The app uses in-memory storage for simplicity (replace with database in production)
+- Location services require GPS permissions
+- Voice commands are processed in real-time
+- AR guidance is generated based on user location and quest targets
 
-#### Subscribing to events
+## Future Enhancements
 
-You can listen for transcriptions, translations, and other events within the onSession function.
+- Database integration (Firebase, PocketBase, or PostgreSQL)
+- Real photo capture and verification
+- Push notifications for new quests
+- Social features (friend requests, quest sharing)
+- Advanced AR features (3D objects, animations)
+- Quest creation tools for users
+- Achievement system and badges
+
+## Troubleshooting
+
+- **Voice commands not working**: Check microphone permissions
+- **Location quests failing**: Ensure GPS is enabled and accurate
+- **Connection issues**: Verify API keys and network connectivity
+- **Quest not appearing**: Check quest expiration times
+
+## License
+
+MIT License - see LICENSE file for details.

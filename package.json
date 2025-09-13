@@ -1,24 +1,31 @@
-{
-  "name": "mentraos-cloud-example-app",
+﻿{
+  "name": "quest-hud-app",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "Social HUD quest app using Mentra OS SDK",
+  "main": "src/index.ts",
   "scripts": {
     "start": "bun src/index.ts",
     "dev": "bun --hot src/index.ts",
+    "backend": "bun backend/server.ts",
+    "dev:backend": "bun --hot backend/server.ts",
+    "dev:all": "concurrently \"bun run dev:backend\" \"bun run dev\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "keywords": ["mentra", "ar", "hud", "quest", "social", "voice-commands"],
+  "author": "Quest HUD Team",
+  "license": "MIT",
   "dependencies": {
     "@mentra/sdk": "latest",
     "express": "^4.21.2",
-    "ws": "^8.18.1"
+    "ws": "^8.18.1",
+    "cors": "^2.8.5"
   },
   "devDependencies": {
     "typescript": "^5.0.0",
     "@types/express": "^5.0.1",
     "@types/node": "^22.13.14",
-    "@types/ws": "^8.18.0"
+    "@types/ws": "^8.18.0",
+    "@types/cors": "^2.8.17",
+    "concurrently": "^8.2.2"
   }
 }
