@@ -7,6 +7,7 @@ import { GooglePlacesService } from "./places-service";
 import { WeatherService } from './weather-service';
 import { BusinessHoursService } from './business-hours-service';
 import { CompetitionService } from './competition-service';
+import { DirectionsService } from './directions-service';
 import { AIQuestGenerator, QuestContext, AIGeneratedQuest } from "./ai-quest-generator";
 import { SampleQuestSeeder } from "./sample-quests";
 
@@ -35,10 +36,11 @@ const WEATHER_API_KEY =
 const PORT = parseInt(process.env.PORT || "3000");
 
 class ExampleMentraOSApp extends AppServer {
-  private database: QuestDatabase;
-  private placesService: GooglePlacesService;
-  private aiQuestGenerator: AIQuestGenerator;
-  private competitionService: CompetitionService;
+  public database: QuestDatabase;
+  public placesService: GooglePlacesService;
+  public aiQuestGenerator: AIQuestGenerator;
+  public competitionService: CompetitionService;
+  public directionsService: DirectionsService;
 
   constructor() {
     super({
@@ -66,6 +68,9 @@ class ExampleMentraOSApp extends AppServer {
     // Set up competition service
     this.competitionService = new CompetitionService();
 
+    // Set up directions service
+    this.directionsService = new DirectionsService(GOOGLE_PLACES_API_KEY);
+
     // Set up Express routes
     setupExpressRoutes(this);
   }
@@ -74,7 +79,7 @@ class ExampleMentraOSApp extends AppServer {
   private userSessionsMap = new Map<string, AppSession>();
 
   /** Map to store user's last known location */
-  private userLocationsMap = new Map<
+  public userLocationsMap = new Map<
     string,
     { lat: number; lng: number; timestamp: Date }
   >();
@@ -637,7 +642,7 @@ class ExampleMentraOSApp extends AppServer {
       this.displayScrollingText(
         session,
         `🎮 POI Quest App loaded!`,
-        `👤 Total Points: ${user.total_points}\n🏆 Quests Completed: ${user.quests_completed}\n\nSay 'new quest' to begin your adventure!\n\nCommands: 'current quest', 'complete quest', 'reroll quest'`
+        `👤 Total Points: ${user.total_points}\n🏆 Quests Completed: ${user.quests_completed}\n\nSay 'new quest' to begin your adventure!\n\nCommands: 'current quest', 'complete quest', 'reroll quest', 'get directions'`
       );
     } catch (error) {
       session.logger.error("Failed to initialize user", { error });
@@ -666,6 +671,11 @@ class ExampleMentraOSApp extends AppServer {
             lat: locationData.lat,
             lng: locationData.lng,
             timestamp: new Date(),
+          });
+          console.log(`Stored location for user ${userId}:`, {
+            lat: locationData.lat,
+            lng: locationData.lng,
+            mapSize: this.userLocationsMap.size
           });
 
           // Check if user is near their quest location (async operation)
@@ -943,6 +953,24 @@ class ExampleMentraOSApp extends AppServer {
           session.logger.error("Error showing distance", { error });
           session.layouts.showTextWall(
             "Error calculating distance. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
+        normalizedText.includes("get directions") ||
+        normalizedText.includes("directions") ||
+        normalizedText.includes("how do i get there") ||
+        normalizedText.includes("navigate")
+      ) {
+        try {
+          await this.playTTSWithDebounce(session, "Getting directions...", {
+            voice_settings: { stability: 0.6, speed: 1.1 }
+          });
+          await this.showDirectionsForUser(userId, session);
+        } catch (error) {
+          session.logger.error("Error showing directions", { error });
+          session.layouts.showTextWall(
+            "Error getting directions. Please try again.",
             { durationMs: 3000 }
           );
         }
@@ -1583,10 +1611,31 @@ Keep completing daily quests to maintain your streak!`;
 
           const distanceInMeters = Math.round(distance * 1000);
 
+          // Try to get walking directions
+          let directionsText = '';
+          try {
+            const directions = await this.directionsService.getWalkingDirections(
+              userLocation.lat,
+              userLocation.lng,
+              questTemplate.location_lat,
+              questTemplate.location_lng
+            );
+
+            if (directions) {
+              const nextSteps = this.directionsService.getNextTwoSteps(directions);
+              if (nextSteps.length > 0) {
+                directionsText = '\n\n' + nextSteps.join('\n');
+              }
+            }
+          } catch (error) {
+            // Silently fail and show just distance
+            session.logger.debug('Failed to get directions, showing distance only', { error });
+          }
+
           if (distance <= 0.1) {
             session.layouts.showTextWall(
-              `🎯 Quest Location Nearby!\nYou're ${distanceInMeters}m away from your quest destination!`,
-              { durationMs: 3000 }
+              `🎯 Quest Location Nearby!\nYou're ${distanceInMeters}m away from your quest destination!${directionsText}`,
+              { durationMs: 5000 }
             );
           } else {
             const distanceText =
@@ -1595,14 +1644,98 @@ Keep completing daily quests to maintain your streak!`;
                 : `${distance.toFixed(1)}km`;
 
             session.layouts.showTextWall(
-              `📍 Quest Distance: ${distanceText}\nto your quest destination`,
-              { durationMs: 3000 }
+              `📍 Quest Distance: ${distanceText}\nto your quest destination${directionsText}`,
+              { durationMs: 5000 }
             );
           }
         }
       }
     } catch (error) {
       session.logger.warn("Error showing distance card", { error });
+    }
+  }
+
+  /**
+   * Show detailed directions for a specific user
+   */
+  private async showDirectionsForUser(
+    userId: string,
+    session: AppSession
+  ): Promise<void> {
+    try {
+      const activeQuest = await this.database.getUserActiveQuest(userId);
+      if (!activeQuest) {
+        session.layouts.showTextWall(
+          "No active quest. Say 'new quest' to get one!",
+          { durationMs: 3000 }
+        );
+        return;
+      }
+
+      const questTemplate = await this.database.getQuestTemplateById(
+        activeQuest.quest_template_id
+      );
+      const userLocation = this.userLocationsMap.get(userId);
+
+      if (!questTemplate || !questTemplate.location_lat || !questTemplate.location_lng) {
+        session.layouts.showTextWall(
+          "Quest location not available for directions.",
+          { durationMs: 3000 }
+        );
+        return;
+      }
+
+      if (!userLocation) {
+        session.layouts.showTextWall(
+          "Your location is needed for directions. Please enable location access.",
+          { durationMs: 4000 }
+        );
+        return;
+      }
+
+      // Get walking directions
+      const directions = await this.directionsService.getWalkingDirections(
+        userLocation.lat,
+        userLocation.lng,
+        questTemplate.location_lat,
+        questTemplate.location_lng
+      );
+
+      if (!directions) {
+        // Fallback to distance only
+        const distance = this.calculateDistance(
+          userLocation.lat,
+          userLocation.lng,
+          questTemplate.location_lat,
+          questTemplate.location_lng
+        );
+
+        const distanceText = distance < 1
+          ? `${Math.round(distance * 1000)}m`
+          : `${distance.toFixed(1)}km`;
+
+        session.layouts.showTextWall(
+          `📍 Distance to ${questTemplate.location_name}: ${distanceText}\n\nDirections unavailable. Use your preferred maps app.`,
+          { durationMs: 5000 }
+        );
+        return;
+      }
+
+      // Show full directions using scrolling text
+      const directionsContent = this.directionsService.formatDirectionsForWebview(directions);
+
+      await this.displayScrollingText(
+        session,
+        `🚶 Directions to ${questTemplate.location_name}`,
+        directionsContent
+      );
+
+    } catch (error) {
+      session.logger.error("Error showing directions", { error });
+      session.layouts.showTextWall(
+        "Error getting directions. Please try again.",
+        { durationMs: 3000 }
+      );
     }
   }
 

@@ -25,9 +25,12 @@ export function setupExpressRoutes(server: AppServer): void {
       let userStats = null;
       let currentQuest = null;
       let questTemplate = null;
+      let directions = null;
 
       if (userId && (server as any).database) {
         const database = (server as any).database;
+        const directionsService = (server as any).directionsService;
+        const userLocationsMap = (server as any).userLocationsMap;
 
         // Get user stats
         try {
@@ -44,6 +47,56 @@ export function setupExpressRoutes(server: AppServer): void {
             questTemplate = await database.getQuestTemplateById(
               currentQuest.quest_template_id
             );
+
+            // Get directions if quest has location and user location is available
+            if (questTemplate && questTemplate.location_lat && questTemplate.location_lng) {
+              const userLocation = userLocationsMap?.get(userId);
+
+              if (userLocation && directionsService) {
+                try {
+                  const walkingDirections = await directionsService.getWalkingDirections(
+                    userLocation.lat,
+                    userLocation.lng,
+                    questTemplate.location_lat,
+                    questTemplate.location_lng
+                  );
+
+                  if (walkingDirections) {
+                    directions = {
+                      steps: walkingDirections.steps,
+                      totalDistance: walkingDirections.totalDistance,
+                      totalDuration: walkingDirections.totalDuration,
+                      formatted: directionsService.formatDirectionsForWebview(walkingDirections)
+                    };
+                  } else {
+                    // Fallback to distance calculation using Haversine formula
+                    const R = 6371; // Earth's radius in kilometers
+                    const dLat = (questTemplate.location_lat - userLocation.lat) * Math.PI / 180;
+                    const dLng = (questTemplate.location_lng - userLocation.lng) * Math.PI / 180;
+                    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                              Math.cos(userLocation.lat * Math.PI / 180) * Math.cos(questTemplate.location_lat * Math.PI / 180) *
+                              Math.sin(dLng/2) * Math.sin(dLng/2);
+                    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+                    const distance = R * c;
+
+                    const distanceText = distance < 1
+                      ? `${Math.round(distance * 1000)}m`
+                      : `${distance.toFixed(1)}km`;
+
+                    directions = {
+                      steps: [],
+                      totalDistance: distanceText,
+                      totalDuration: null,
+                      formatted: null,
+                      fallback: true,
+                      fallbackMessage: `Distance to ${questTemplate.location_name}: ${distanceText}. Directions unavailable - use your preferred maps app.`
+                    };
+                  }
+                } catch (error) {
+                  console.warn('Failed to get walking directions for webview:', error);
+                }
+              }
+            }
           }
         } catch (error) {
           console.error("Error fetching user data for webview:", error);
@@ -55,6 +108,7 @@ export function setupExpressRoutes(server: AppServer): void {
         userStats,
         currentQuest,
         questTemplate,
+        directions,
       });
     } catch (error) {
       console.error("Error rendering webview:", error);
@@ -63,6 +117,7 @@ export function setupExpressRoutes(server: AppServer): void {
         userStats: null,
         currentQuest: null,
         questTemplate: null,
+        directions: null,
       });
     }
   });
@@ -361,4 +416,112 @@ export function setupExpressRoutes(server: AppServer): void {
       }
     }
   );
+
+  // API endpoint for getting quest directions
+  app.get(
+    "/api/quest/directions",
+    // @ts-ignore
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const userId = req.authUserId;
+        if (!userId) {
+          return res.json({ success: false, message: "Not authenticated" });
+        }
+
+        const database = (server as any).database;
+        const directionsService = (server as any).directionsService;
+        const userLocationsMap = (server as any).userLocationsMap;
+
+        // Check if user has an active quest
+        const activeQuest = await database.getUserActiveQuest(userId);
+        if (!activeQuest) {
+          return res.json({
+            success: false,
+            message: "You don't have an active quest!",
+          });
+        }
+
+        const questTemplate = await database.getQuestTemplateById(
+          activeQuest.quest_template_id
+        );
+
+        if (!questTemplate || !questTemplate.location_lat || !questTemplate.location_lng) {
+          return res.json({
+            success: false,
+            message: "Quest location not available for directions.",
+          });
+        }
+
+        const userLocation = userLocationsMap?.get(userId);
+        if (!userLocation) {
+          return res.json({
+            success: false,
+            message: "Your location is needed for directions. Please enable location access.",
+          });
+        }
+
+        // Get walking directions
+        const directions = await directionsService.getWalkingDirections(
+          userLocation.lat,
+          userLocation.lng,
+          questTemplate.location_lat,
+          questTemplate.location_lng
+        );
+
+        if (!directions) {
+          // Fallback to distance only - calculate distance manually using Haversine formula
+          const R = 6371; // Earth's radius in kilometers
+          const dLat = (questTemplate.location_lat - userLocation.lat) * Math.PI / 180;
+          const dLng = (questTemplate.location_lng - userLocation.lng) * Math.PI / 180;
+          const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                    Math.cos(userLocation.lat * Math.PI / 180) * Math.cos(questTemplate.location_lat * Math.PI / 180) *
+                    Math.sin(dLng/2) * Math.sin(dLng/2);
+          const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+          const distance = R * c;
+
+          const distanceText = distance < 1
+            ? `${Math.round(distance * 1000)}m`
+            : `${distance.toFixed(1)}km`;
+
+          return res.json({
+            success: true,
+            message: `Distance to ${questTemplate.location_name}: ${distanceText}. Directions unavailable - use your preferred maps app.`,
+            directions: null,
+            distance: distanceText,
+            quest: activeQuest,
+            template: questTemplate
+          });
+        }
+
+        // Format directions for display
+        const directionsText = directionsService.formatDirectionsForWebview(directions);
+
+        res.json({
+          success: true,
+          message: `Directions to ${questTemplate.location_name}`,
+          directions: directionsText,
+          distance: directions.totalDistance,
+          duration: directions.totalDuration,
+          quest: activeQuest,
+          template: questTemplate
+        });
+
+      } catch (error) {
+        console.error("Error getting directions via API:", error);
+        res.json({ success: false, message: "Server error" });
+      }
+    }
+  );
+
+  // API endpoint for getting leaderboard
+  app.get("/api/leaderboard", async (req, res) => {
+    try {
+      const database = (server as any).database;
+      const leaderboard = await database.getAllUsersLeaderboard();
+      res.json(leaderboard);
+    } catch (error) {
+      console.error("Error fetching leaderboard via API:", error);
+      res.json([]);
+    }
+  });
 }

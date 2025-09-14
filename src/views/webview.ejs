@@ -164,6 +164,100 @@
         gap: 8px;
       }
 
+      /* Directions Section */
+      .directions-section {
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 16px;
+        padding: 20px;
+        margin-bottom: 20px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+      }
+
+      .directions-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 16px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+      }
+
+      .directions-header span:first-child {
+        font-size: 1.5rem;
+      }
+
+      .directions-header h3 {
+        margin: 0;
+        font-size: 1.2rem;
+        font-weight: 600;
+        color: #ffffff;
+        flex-grow: 1;
+      }
+
+      .directions-distance {
+        font-size: 0.9rem;
+        opacity: 0.8;
+        font-weight: 500;
+      }
+
+      .directions-content {
+        line-height: 1.6;
+      }
+
+      .direction-step {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        padding: 10px 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      }
+
+      .direction-step:last-child {
+        border-bottom: none;
+      }
+
+      .direction-step-number {
+        background: rgba(255, 255, 255, 0.2);
+        border-radius: 50%;
+        width: 24px;
+        height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.8rem;
+        font-weight: bold;
+        flex-shrink: 0;
+      }
+
+      .direction-step-content {
+        flex-grow: 1;
+      }
+
+      .direction-step-instruction {
+        font-weight: 500;
+        margin-bottom: 4px;
+      }
+
+      .direction-step-distance {
+        font-size: 0.85rem;
+        opacity: 0.7;
+      }
+
+      .directions-error {
+        text-align: center;
+        opacity: 0.8;
+        font-style: italic;
+      }
+
+      .directions-fallback {
+        text-align: center;
+        padding: 16px;
+        background: rgba(255, 193, 7, 0.1);
+        border: 1px solid rgba(255, 193, 7, 0.3);
+        border-radius: 12px;
+        color: #ffc107;
+      }
+
       /* Buttons */
       .button {
         width: 100%;
@@ -320,6 +414,7 @@
         0% {
           transform: rotate(0deg);
         }
+
         100% {
           transform: rotate(360deg);
         }
@@ -362,6 +457,7 @@
           opacity: 0;
           transform: translateY(30px);
         }
+
         to {
           opacity: 1;
           transform: translateY(0);
@@ -369,6 +465,7 @@
       }
     </style>
   </head>
+
   <body>
     <div class="container">
       <!-- Header -->
@@ -399,7 +496,7 @@
         </div>
         <% if (userId) { %>
         <div style="text-align: center; opacity: 0.8; font-size: 0.9rem">
-          Logged in as: <strong><%= userId %></strong>
+          Logged in as: <strong> <%= userId %> </strong>
         </div>
         <% } else { %>
         <div style="text-align: center; opacity: 0.8; color: #feca57">
@@ -425,18 +522,22 @@
             <div class="quest-details">
               <div class="quest-detail-item">
                 <span>📍</span>
-                <span><strong><%= questTemplate.location_name %></strong></span>
+                <span
+                  ><strong> <%= questTemplate.location_name %> </strong></span
+                >
               </div>
               <div class="quest-detail-item">
                 <span>🏠</span>
-                <span><%= questTemplate.location_address %></span>
+                <span> <%= questTemplate.location_address %> </span>
               </div>
               <div class="quest-detail-item">
                 <span>🏆</span>
-                <span><strong><%= questTemplate.points %> points</strong></span>
+                <span
+                  ><strong> <%= questTemplate.points %> points </strong></span
+                >
               </div>
               <% if (questTemplate.required_items &&
-              questTemplate.required_items.length > 0) { %>
+              questTemplate.required_items.length> 0) { %>
               <div class="quest-detail-item">
                 <span>🎒</span>
                 <span
@@ -458,6 +559,65 @@
               <% } %>
             </div>
           </div>
+
+          <!-- Directions Section -->
+          <% if (directions) { %>
+          <div class="directions-section">
+            <div class="directions-header">
+              <span>🧭</span>
+              <h3>Walking Directions</h3>
+              <span class="directions-distance">
+                <%= directions.totalDuration ? directions.totalDistance + ' • '
+                + directions.totalDuration : directions.totalDistance || '' %>
+              </span>
+            </div>
+            <div class="directions-content">
+              <% if (directions.fallback) { %>
+              <div class="directions-fallback">
+                <strong>📍 <%= directions.totalDistance %></strong><br />
+                Directions unavailable - use your preferred maps app
+              </div>
+              <% } else if (directions.steps && directions.steps.length > 0) {
+              %>
+              <%
+                // Define arrow mapping based on common direction keywords
+                function getDirectionArrow(instruction) {
+                  const lower = instruction.toLowerCase();
+                  if (lower.includes('left') || lower.includes('turn left')) return '←';
+                  if (lower.includes('right') || lower.includes('turn right')) return '→';
+                  if (lower.includes('straight') || lower.includes('continue')) return '↑';
+                  if (lower.includes('u-turn') || lower.includes('turn around')) return '↶';
+                  if (lower.includes('slight left')) return '↖';
+                  if (lower.includes('slight right')) return '↗';
+                  if (lower.includes('sharp left')) return '↺';
+                  if (lower.includes('sharp right')) return '↻';
+                  if (lower.includes('north')) return '↑';
+                  if (lower.includes('south')) return '↓';
+                  if (lower.includes('east')) return '→';
+                  if (lower.includes('west')) return '←';
+                  return '•'; // Default bullet for unclear directions
+                }
+              %>
+              <% directions.steps.forEach(function(step, index) { %>
+              <div class="direction-step">
+                <div class="direction-step-number"><%= getDirectionArrow(step.instruction) %></div>
+                <div class="direction-step-content">
+                  <div class="direction-step-instruction">
+                    <%= step.instruction %>
+                  </div>
+                  <% if (step.distance && step.duration) { %>
+                  <div class="direction-step-distance">
+                    <%= step.distance %> • <%= step.duration %>
+                  </div>
+                  <% } %>
+                </div>
+              </div>
+              <% }); %> <% } else { %>
+              <div class="directions-error">Unable to load directions</div>
+              <% } %>
+            </div>
+          </div>
+          <% } %>
 
           <button class="button button-success" onclick="completeQuest()">
             ✅ Complete Quest
@@ -572,7 +732,7 @@
           list.innerHTML = "";
 
           if (data.length === 0) {
-            list.innerHTML = '<div class="loading">No players yet</div>';
+            list.innerHTML = ' <div class="loading">No players yet</div>';
             return;
           }
 
@@ -581,13 +741,12 @@
             li.className = `leaderboard-item ${
               index < 3 ? "rank-" + (index + 1) : ""
             }`;
-
-            li.innerHTML = `
-              <div class="player-info">
-                <span class="player-rank">#${index + 1}</span>
-                <span class="player-name">${player.id}</span>
-              </div>
-              <span class="player-points">${player.total_points} pts</span>
+            li.innerHTML = ` <div
+                  class="player-info">
+                  <spa;n class="player-rank">#${index + 1}</span>
+                    <span class="player-name">${player.id}</span>
+            </div>
+            <span class="player-points">${player.total_points} pts</span>
             `;
 
             list.appendChild(li);
