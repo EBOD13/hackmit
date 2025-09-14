@@ -1,9 +1,14 @@
-﻿import { ToolCall, AppServer, AppSession } from '@mentra/sdk';
+import { ToolCall, AppServer, AppSession } from "@mentra/sdk";
 import path from "path";
 import { setupExpressRoutes } from "./webview";
 import { handleToolCall } from "./tools";
 import { QuestDatabase, User, QuestTemplate, ActiveQuest } from "./database";
 import { GooglePlacesService, QuestLocation } from "./places-service";
+import {
+  AIQuestGenerator,
+  QuestContext,
+  AIGeneratedQuest,
+} from "./ai-quest-generator";
 
 const PACKAGE_NAME =
   process.env.PACKAGE_NAME ??
@@ -20,11 +25,19 @@ const GOOGLE_PLACES_API_KEY =
   (() => {
     throw new Error("GOOGLE_PLACES_API_KEY is not set in .env file");
   })();
+const ANTHROPIC_API_KEY =
+  process.env.ANTHROPIC_API_KEY ??
+  (() => {
+    throw new Error("ANTHROPIC_API_KEY is not set in .env file");
+  })();
+const WEATHER_API_KEY =
+  process.env.WEATHER_API_KEY || "your_weather_api_key_here";
 const PORT = parseInt(process.env.PORT || "3000");
 
 class ExampleMentraOSApp extends AppServer {
   private database: QuestDatabase;
   private placesService: GooglePlacesService;
+  private aiQuestGenerator: AIQuestGenerator;
 
   constructor() {
     super({
@@ -43,6 +56,12 @@ class ExampleMentraOSApp extends AppServer {
       this.database
     );
 
+    // Set up AI quest generator
+    this.aiQuestGenerator = new AIQuestGenerator(
+      ANTHROPIC_API_KEY,
+      WEATHER_API_KEY
+    );
+
     // Set up Express routes
     setupExpressRoutes(this);
   }
@@ -59,71 +78,11 @@ class ExampleMentraOSApp extends AppServer {
   /** Map to store last distance notification time to prevent spam */
   private lastDistanceNotificationMap = new Map<string, number>();
 
-  private questTTSPlayedMap = new Map<string, string>(); // Track which quests have had TTS played
+  /** Map to store periodic distance update intervals */
+  private distanceUpdateIntervals = new Map<string, NodeJS.Timeout>();
 
-  private lastTTSTimeMap = new Map<string, number>(); // Track last TTS time for debouncing
-  private activeTTSMap = new Map<string, boolean>(); // Track if TTS is currently playing for a user
-
-  /**
-   * Play TTS with debounce protection to prevent overlapping audio
-   * @param session - The app session
-   * @param text - Text to speak
-   * @param options - Voice settings options
-   * @param forcePlay - Whether to bypass debounce (for critical messages)
-   * @returns Promise<boolean> - Whether TTS was played
-   */
-  private async playTTSWithDebounce(
-    session: AppSession,
-    text: string,
-    options?: any,
-    forcePlay: boolean = false
-  ): Promise<boolean> {
-    const userId = Array.from(this.userSessionsMap.entries())
-      .find(([_, sess]) => sess === session)?.[0];
-    
-    if (!userId) return false;
-    
-    const now = Date.now();
-    const lastTTSTime = this.lastTTSTimeMap.get(userId) || 0;
-    const isCurrentlyPlaying = this.activeTTSMap.get(userId) || false;
-    const debounceDelay = 2000; // 2 seconds debounce
-    
-    // Check if we should play TTS
-    const timeSinceLastTTS = now - lastTTSTime;
-    const shouldPlay = forcePlay || (!isCurrentlyPlaying && timeSinceLastTTS > debounceDelay);
-    
-    if (!shouldPlay) {
-      session.logger.info("TTS skipped due to debounce", {
-        timeSinceLastTTS,
-        isCurrentlyPlaying,
-        forcePlay,
-        text: text.substring(0, 30) + "..."
-      });
-      return false;
-    }
-    
-    try {
-      // Mark as playing and update timestamp BEFORE starting TTS
-      this.activeTTSMap.set(userId, true);
-      this.lastTTSTimeMap.set(userId, now);
-      
-      await session.audio.speak(text, options);
-      
-      session.logger.info("TTS played successfully", { text: text.substring(0, 50) + "..." });
-      
-      // Keep the debounce active for a short period after TTS completes
-      setTimeout(() => {
-        this.activeTTSMap.set(userId, false);
-      }, 500); // 500ms buffer after TTS completes
-      
-      return true;
-    } catch (error) {
-      session.logger.warn("Failed to play TTS", { error, text: text.substring(0, 50) + "..." });
-      // Reset immediately on error
-      this.activeTTSMap.set(userId, false);
-      return false;
-    }
-  }
+  /** Map to track when scrolling text is active for each user */
+  private scrollingTextActive = new Map<string, boolean>();
 
   /**
    * Get a random quest template from database
@@ -138,29 +97,135 @@ class ExampleMentraOSApp extends AppServer {
   }
 
   /**
-   * Generate a location-aware quest using Google Places API
+   * Generate an AI-powered quest using context and nearby POIs
    */
-  private async generateLocationAwareQuest(
+  private async generateAIQuest(
     lat: number,
     lng: number,
+    userId: string,
     session: AppSession
   ): Promise<QuestTemplate | null> {
     try {
-      session.logger.info("Generating location-aware quest", { lat, lng });
+      session.logger.info("Generating AI-powered quest", { lat, lng });
 
+      // Get nearby POIs from multiple categories
+      const questTypes = [
+        "food",
+        "exercise",
+        "culture",
+        "exploration",
+      ] as const;
+      let allNearbyPOIs: any[] = [];
+
+      for (const questType of questTypes) {
+        try {
+          const pois = await this.placesService.findNearbyPlaces(
+            lat,
+            lng,
+            questType,
+            2000
+          );
+          allNearbyPOIs = [...allNearbyPOIs, ...pois];
+        } catch (error) {
+          session.logger.warn(`Failed to fetch ${questType} POIs`, { error });
+        }
+      }
+
+      if (allNearbyPOIs.length === 0) {
+        session.logger.warn("No POIs found nearby, falling back to database");
+        return await this.getRandomQuestTemplate();
+      }
+
+      // Build context for AI
+      const questContext: QuestContext = {
+        currentTime: new Date(),
+        weather: await this.aiQuestGenerator.getWeather(lat, lng),
+        nearbyPOIs: allNearbyPOIs,
+        recentQuestCategories: await this.database.getRecentQuestCategories(
+          userId,
+          3
+        ),
+        userLocation: { lat, lng },
+      };
+
+      session.logger.info("Quest context prepared", {
+        poisCount: allNearbyPOIs.length,
+        weather: questContext.weather?.condition,
+        recentCategories: questContext.recentQuestCategories,
+      });
+
+      allNearbyPOIs.push({
+        name: "Somewhere nearby",
+        formatted_address: "Your current location",
+        geometry: { location: { lat, lng } },
+        types: ["general"],
+        rating: null,
+        user_ratings_total: null,
+      });
+
+      // Generate quest using AI
+      const aiQuest: AIGeneratedQuest =
+        await this.aiQuestGenerator.generateQuest(questContext);
+      const selectedPOI = allNearbyPOIs[aiQuest.selectedPOIIndex];
+
+      if (!selectedPOI) {
+        throw new Error(
+          `Invalid POI selection: index ${aiQuest.selectedPOIIndex} out of ${allNearbyPOIs.length} POIs`
+        );
+      }
+
+      // Create quest template in database
+      const questTemplate = await this.database.createQuestTemplate({
+        title: aiQuest.title,
+        description: aiQuest.description,
+        category: "ai-generated", // We could infer this from the POI type
+        points: aiQuest.points,
+        location_name: selectedPOI.name,
+        location_address: selectedPOI.formatted_address,
+        location_lat: selectedPOI.geometry.location.lat,
+        location_lng: selectedPOI.geometry.location.lng,
+      });
+
+      session.logger.info("Generated AI-powered quest", {
+        questId: questTemplate.id,
+        selectedPOI: selectedPOI.name,
+        aiReasoning: aiQuest.reasoning,
+        points: aiQuest.points,
+        distance: this.calculateDistance(
+          lat,
+          lng,
+          selectedPOI.geometry.location.lat,
+          selectedPOI.geometry.location.lng
+        ),
+      });
+
+      return questTemplate;
+    } catch (error) {
+      session.logger.error("Error generating AI-powered quest", { error });
+      // Fallback to the old method
+      return await this.generateFallbackQuest(lat, lng, userId, session);
+    }
+  }
+
+  /**
+   * Fallback quest generation using the old method
+   */
+  private async generateFallbackQuest(
+    lat: number,
+    lng: number,
+    userId: string,
+    session: AppSession
+  ): Promise<QuestTemplate | null> {
+    try {
       const questLocations = await this.placesService.findQuestLocations(
         lat,
         lng
       );
 
       if (questLocations.length === 0) {
-        session.logger.warn(
-          "No quest locations found nearby, falling back to database"
-        );
         return await this.getRandomQuestTemplate();
       }
 
-      // Pick a random quest location
       const randomLocation =
         questLocations[Math.floor(Math.random() * questLocations.length)];
       const questData = this.placesService.generateQuestDescription(
@@ -168,7 +233,6 @@ class ExampleMentraOSApp extends AppServer {
         randomLocation.questType
       );
 
-      // Save the generated quest template to database FIRST
       const questTemplate = await this.database.createQuestTemplate({
         title: questData.title,
         description: questData.description,
@@ -180,22 +244,9 @@ class ExampleMentraOSApp extends AppServer {
         location_lng: randomLocation.place.geometry.location.lng,
       });
 
-      session.logger.info("Generated location-aware quest", {
-        questId: questTemplate.id,
-        place: randomLocation.place.name,
-        category: randomLocation.category,
-        distance: this.calculateDistance(
-          lat,
-          lng,
-          questTemplate.location_lat!,
-          questTemplate.location_lng!
-        ),
-      });
-
       return questTemplate;
     } catch (error) {
-      session.logger.error("Error generating location-aware quest", { error });
-      // Fallback to database quest
+      session.logger.error("Error in fallback quest generation", { error });
       return await this.getRandomQuestTemplate();
     }
   }
@@ -220,18 +271,33 @@ class ExampleMentraOSApp extends AppServer {
    * @param text
    */
   private wrapText(text: string, maxLineLength: number = 36): string[] {
-    const words = text.split(" ");
+    // First split by newlines to respect existing line breaks
+    const paragraphs = text.split("\n");
     const lines: string[] = [];
-    let currentLine = "";
-    for (const word of words) {
-      if ((currentLine + word).length > maxLineLength || word.includes("\n")) {
-        lines.push(currentLine.trim());
-        currentLine = word + " ";
+
+    for (const paragraph of paragraphs) {
+      if (paragraph.trim() === "") {
+        lines.push("");
       } else {
-        currentLine += word + " ";
+        const words = paragraph.split(" ");
+        let currentLine = "";
+
+        for (const word of words) {
+          if (word.trim() === "") continue;
+
+          if (currentLine === "") {
+            currentLine = word;
+          } else if ((currentLine + " " + word).length <= maxLineLength) {
+            currentLine += " " + word;
+          } else {
+            lines.push(currentLine);
+            currentLine = word;
+          }
+        }
+        if (currentLine.trim() !== "") lines.push(currentLine);
       }
     }
-    lines.push(currentLine.trim());
+
     return lines;
   }
 
@@ -243,13 +309,13 @@ class ExampleMentraOSApp extends AppServer {
     title: string,
     content: string,
     maxLinesPerScreen: number = 3,
-    scrollDelay: number = 1000
+    scrollDelay: number = 1750
   ): Promise<void> {
-    const userId = Array.from(this.userSessionsMap.entries())
-      .find(([_, sess]) => sess === session)?.[0];
-    
+    const userId = Array.from(this.userSessionsMap.entries()).find(
+      ([_, sess]) => sess === session
+    )?.[0];
+
     const lines = this.wrapText(content);
-    console.log("Wrapped lines:", lines.join("\n"));
 
     // If content fits in one screen, show normally
     if (lines.length <= maxLinesPerScreen) {
@@ -257,11 +323,19 @@ class ExampleMentraOSApp extends AppServer {
       return;
     }
 
+    // Mark scrolling as active for this user
+    if (userId) {
+      this.scrollingTextActive.set(userId, true);
+    }
+
     session.logger.info("Displaying scrolling text", {
       totalLines: lines.length,
       maxLinesPerScreen,
       scrollDelay,
     });
+
+    // Calculate total scrolling duration
+    const totalScrollPositions = lines.length - maxLinesPerScreen + 1;
 
     // Show initial screen first (lines 0-4)
     let currentWindow = lines.slice(0, maxLinesPerScreen);
@@ -273,8 +347,6 @@ class ExampleMentraOSApp extends AppServer {
     await new Promise((resolve) => setTimeout(resolve, scrollDelay));
 
     // Scroll through the content one line at a time
-    const totalScrollPositions = lines.length - maxLinesPerScreen + 1;
-
     for (let position = 1; position < totalScrollPositions; position++) {
       const windowLines = lines.slice(position, position + maxLinesPerScreen);
       const windowContent = windowLines.join("\n");
@@ -294,6 +366,11 @@ class ExampleMentraOSApp extends AppServer {
         await new Promise((resolve) => setTimeout(resolve, scrollDelay));
       }
     }
+
+    // Mark scrolling as completed for this user
+    if (userId) {
+      this.scrollingTextActive.set(userId, false);
+    }
   }
 
   /**
@@ -302,6 +379,7 @@ class ExampleMentraOSApp extends AppServer {
   private async displayQuestTemplate(
     session: AppSession,
     questTemplate: QuestTemplate,
+    userId: string,
     userLocation?: { lat: number; lng: number }
   ): Promise<void> {
     // Build quest content
@@ -329,11 +407,15 @@ class ExampleMentraOSApp extends AppServer {
       questContent
     );
 
+    setTimeout(() => {
+      this.showDistanceCardForUser(userId, session);
+    }, 5000);
+    // Schedule distance card to show after single screen display
 
     session.logger.info("Quest displayed", {
       questId: questTemplate.id,
       title: questTemplate.title,
-      category: questTemplate.category
+      category: questTemplate.category,
     });
   }
 
@@ -393,9 +475,10 @@ class ExampleMentraOSApp extends AppServer {
       });
 
       // Show welcome message with user stats
-      session.layouts.showTextWall(
-        `🎮 POI Quest App loaded!\n\n👤 Total Points: ${user.total_points}\n🏆 Quests Completed: ${user.quests_completed}\n\nSay 'new quest' to begin your adventure!`,
-        { durationMs: 5000 }
+      this.displayScrollingText(
+        session,
+        `🎮 POI Quest App loaded!`,
+        `👤 Total Points: ${user.total_points}\n🏆 Quests Completed: ${user.quests_completed}\n\nSay 'new quest' to begin your adventure!\n\nCommands: 'current quest', 'complete quest', 'reroll quest'`
       );
     } catch (error) {
       session.logger.error("Failed to initialize user", { error });
@@ -414,7 +497,9 @@ class ExampleMentraOSApp extends AppServer {
             latitude: locationData.lat,
             longitude: locationData.lng,
             accuracy: locationData.accuracy,
-            timestamp: locationData.timestamp ? new Date(locationData.timestamp).toLocaleString() : 'Unknown',
+            timestamp: locationData.timestamp
+              ? new Date(locationData.timestamp).toLocaleString()
+              : "Unknown",
           });
 
           // Store user's current location
@@ -438,6 +523,18 @@ class ExampleMentraOSApp extends AppServer {
     } catch (error) {
       session.logger.warn("Failed to start location tracking", { error });
     }
+
+    // Set up periodic distance updates every 30 seconds
+    const distanceInterval = setInterval(() => {
+      this.showDistanceCardForUser(userId, session).catch((error) => {
+        session.logger.warn("Error in periodic distance update", { error });
+      });
+    }, 30000);
+
+    this.distanceUpdateIntervals.set(userId, distanceInterval);
+    session.logger.info(
+      "Location tracking and periodic distance updates started"
+    );
 
     /**
      * Handles quest-related voice commands
@@ -467,12 +564,16 @@ class ExampleMentraOSApp extends AppServer {
           let questTemplate: QuestTemplate | null = null;
 
           if (userLocation) {
-            session.layouts.showTextWall("🔍 Finding nearby adventures...", {
-              durationMs: 2000,
-            });
-            questTemplate = await this.generateLocationAwareQuest(
+            session.layouts.showTextWall(
+              "🔍 AI is analyzing your surroundings for the perfect adventure...",
+              {
+                durationMs: 3000,
+              }
+            );
+            questTemplate = await this.generateAIQuest(
               userLocation.lat,
               userLocation.lng,
+              userId,
               session
             );
           } else {
@@ -490,6 +591,7 @@ class ExampleMentraOSApp extends AppServer {
               await this.displayQuestTemplate(
                 session,
                 questTemplate,
+                userId,
                 userLocation || undefined
               );
 
@@ -535,6 +637,7 @@ class ExampleMentraOSApp extends AppServer {
               await this.displayQuestTemplate(
                 session,
                 questTemplate,
+                userId,
                 userLocation
               );
             } else {
@@ -573,22 +676,8 @@ class ExampleMentraOSApp extends AppServer {
             // Get updated user stats
             const user = await this.database.getUser(userId);
 
-            // Play celebration audio
-            await this.playTTSWithDebounce(
+            this.displayScrollingText(
               session,
-              `Quest completed! You earned ${points} points. Your total is now ${user?.total_points || 0} points.`,
-              {
-                voice_settings: {
-                  stability: 0.4,
-                  similarity_boost: 0.85,
-                  style: 0.8,
-                  speed: 1.0
-                }
-              },
-              true // Force play for quest completion
-            );
-
-            session.layouts.showReferenceCard(
               "🎉 Quest Completed!",
               `Congratulations! You earned ${points} points for completing "${
                 questTemplate?.title || "your quest"
@@ -596,8 +685,7 @@ class ExampleMentraOSApp extends AppServer {
                 user?.total_points || 0
               }\n🏆 Quests Completed: ${
                 user?.quests_completed || 0
-              }\n\nSay 'new quest' for your next adventure.`,
-              { durationMs: 5000 }
+              }\n\nSay 'new quest' for your next adventure.`
             );
 
             session.logger.info("Quest completed", {
@@ -616,6 +704,89 @@ class ExampleMentraOSApp extends AppServer {
           session.logger.error("Error completing quest", { error });
           session.layouts.showTextWall(
             "Error completing quest. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
+        normalizedText.includes("reroll quest") ||
+        normalizedText.includes("re-roll quest") ||
+        normalizedText.includes("new quest please") ||
+        normalizedText.includes("different quest") ||
+        normalizedText.includes("skip quest")
+      ) {
+        try {
+          // Check if user has an active quest to reroll
+          const existingQuest = await this.database.getUserActiveQuest(userId);
+          if (!existingQuest) {
+            session.layouts.showTextWall(
+              "You don't have an active quest to reroll. Say 'new quest' to get one!",
+              { durationMs: 3000 }
+            );
+            return;
+          }
+
+          // Mark current quest as abandoned
+          await this.database.abandonQuest(existingQuest.id);
+
+          session.layouts.showTextWall(
+            "🔄 Quest abandoned. Getting you a new adventure...",
+            { durationMs: 3000 }
+          );
+
+          // Generate a new quest
+          const userLocation = this.userLocationsMap.get(userId);
+          let questTemplate: QuestTemplate | null = null;
+
+          if (userLocation) {
+            session.layouts.showTextWall(
+              "🔍 AI is analyzing your surroundings for a different adventure...",
+              { durationMs: 10000 }
+            );
+            questTemplate = await this.generateAIQuest(
+              userLocation.lat,
+              userLocation.lng,
+              userId,
+              session
+            );
+          } else {
+            session.logger.info(
+              "No location available, using random quest for reroll"
+            );
+            questTemplate = await this.getRandomQuestTemplate();
+          }
+
+          if (questTemplate) {
+            const activeQuest = await this.database.createActiveQuest(
+              userId,
+              questTemplate.id
+            );
+            if (activeQuest) {
+              await this.displayQuestTemplate(
+                session,
+                questTemplate,
+                userId,
+                userLocation
+              );
+              session.layouts.showTextWall(
+                "🎯 Here's your new quest! Say 'complete quest' when done.",
+                { durationMs: 4000 }
+              );
+            } else {
+              session.layouts.showTextWall(
+                "Failed to create new quest. Please try again.",
+                { durationMs: 3000 }
+              );
+            }
+          } else {
+            session.layouts.showTextWall(
+              "No new quests available right now. Please try again later.",
+              { durationMs: 3000 }
+            );
+          }
+        } catch (error) {
+          session.logger.error("Error rerolling quest", { error });
+          session.layouts.showTextWall(
+            "Error getting new quest. Please try again.",
             { durationMs: 3000 }
           );
         }
@@ -644,36 +815,6 @@ class ExampleMentraOSApp extends AppServer {
         displayTranscription(data.text);
         // Handle quest commands first
         await handleQuestCommands(data.text);
-        
-        // Handle voice commands
-        const lowerText = data.text.toLowerCase().trim();
-        
-        // Get userId for debouncing
-        const userId = Array.from(this.userSessionsMap.entries())
-          .find(([_, sess]) => sess === session)?.[0];
-        
-        if (userId) {
-          
-          if (lowerText.includes("new quest") || lowerText.includes("next quest")) {
-            await this.playTTSWithDebounce(session, "Finding your next adventure!", {
-              voice_settings: { stability: 0.6, speed: 1.1 }
-            });
-          } else if (lowerText.includes("complete quest") || lowerText.includes("finish quest")) {
-            // No TTS confirmation for quest completion
-          } else if (lowerText.includes("show distance") || lowerText.includes("how far")) {
-            await this.playTTSWithDebounce(session, "Calculating your location...", {
-              voice_settings: { stability: 0.6, speed: 1.1 }
-            });
-            // Show distance to quest location
-            await this.showDistanceCardForUser(userId, session);
-          } else if (lowerText.includes("show leaderboard") || lowerText.includes("get leaderboard") || lowerText.includes("rankings")) {
-            await this.playTTSWithDebounce(session, "Checking the rankings...", {
-              voice_settings: { stability: 0.6, speed: 1.1 }
-            });
-            // Always execute the leaderboard command regardless of TTS debounce
-            await this.showLeaderboard(session);
-          }
-        }
       }
     });
 
@@ -696,10 +837,17 @@ class ExampleMentraOSApp extends AppServer {
     this.addCleanupHandler(() => {
       this.userSessionsMap.delete(userId);
       this.userLocationsMap.delete(userId);
-      this.questTTSPlayedMap.delete(userId); // Clean up TTS tracking
-      this.lastTTSTimeMap.delete(userId); // Clean up TTS debounce tracking
-      this.activeTTSMap.delete(userId); // Clean up active TTS tracking
-      
+
+      // Clear periodic distance updates
+      const distanceInterval = this.distanceUpdateIntervals.get(userId);
+      if (distanceInterval) {
+        clearInterval(distanceInterval);
+        this.distanceUpdateIntervals.delete(userId);
+      }
+
+      // Clear scrolling text state
+      this.scrollingTextActive.delete(userId);
+
       if (stopLocationUpdates) {
         stopLocationUpdates();
       }
@@ -707,110 +855,57 @@ class ExampleMentraOSApp extends AppServer {
   }
 
   /**
-   * Show leaderboard with all users' points
+   * Show distance card for a specific user
    */
-  private async showLeaderboard(session: AppSession): Promise<void> {
+  private async showDistanceCardForUser(
+    userId: string,
+    session: AppSession
+  ): Promise<void> {
     try {
-      const users = await this.database.getAllUsersLeaderboard();
-      
-      if (users.length === 0) {
-        session.layouts.showTextWall(
-          "🏆 Leaderboard\n\nNo users found yet!\nComplete some quests to appear on the leaderboard.",
-          { durationMs: 4000 }
+      // Don't show distance card if scrolling text is currently active
+      if (this.scrollingTextActive.get(userId)) {
+        session.logger.debug(
+          "Skipping distance card display - scrolling text is active"
         );
         return;
       }
-
-      // Build leaderboard content
-      let leaderboardContent = "🏆 Quest Leaderboard\n\n";
-      
-      users.forEach((user, index) => {
-        const rank = index + 1;
-        const medal = rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : `${rank}.`;
-        const userId = user.id.length > 12 ? `${user.id.substring(0, 12)}...` : user.id;
-        
-        leaderboardContent += `${medal} ${userId}\n`;
-        leaderboardContent += `   Points: ${user.total_points}\n\n`;
-      });
-
-      // Use scrolling display for long leaderboards
-      await this.displayScrollingText(
-        session,
-        "🏆 Quest Leaderboard",
-        leaderboardContent.trim()
-      );
-
-      session.logger.info("Leaderboard displayed", {
-        totalUsers: users.length,
-        topUser: users[0]?.id,
-        topPoints: users[0]?.total_points
-      });
-    } catch (error) {
-      session.logger.error("Error showing leaderboard", { error });
-      session.layouts.showTextWall(
-        "Error loading leaderboard. Please try again.",
-        { durationMs: 3000 }
-      );
-    }
-  }
-
-
-  /**
-   * Show distance card for a specific user
-   */
-  private async showDistanceCardForUser(userId: string, session: AppSession): Promise<void> {
-    try {
       const activeQuest = await this.database.getUserActiveQuest(userId);
       if (activeQuest) {
         const questTemplate = await this.database.getQuestTemplateById(
           activeQuest.quest_template_id
         );
         const userLocation = this.userLocationsMap.get(userId);
-        
-        if (questTemplate && questTemplate.location_lat && questTemplate.location_lng && userLocation) {
+
+        if (
+          questTemplate &&
+          questTemplate.location_lat &&
+          questTemplate.location_lng &&
+          userLocation
+        ) {
           const distance = this.calculateDistance(
             userLocation.lat,
             userLocation.lng,
             questTemplate.location_lat,
             questTemplate.location_lng
           );
-          
+
           const distanceInMeters = Math.round(distance * 1000);
-          
+
           if (distance <= 0.1) {
-            const message = `🎯 Quest Location Nearby!\nYou're ${distanceInMeters}m away from your quest destination!`;
-            session.layouts.showTextWall(message, { durationMs: 3000 });
-            
-            // Audio notification for nearby location
-            await this.playTTSWithDebounce(session, `You're very close! Only ${distanceInMeters} meters to your quest destination.`, {
-              voice_settings: {
-                stability: 0.5,
-                similarity_boost: 0.8,
-                style: 0.7,
-                speed: 1.1
-              }
-            });
+            session.layouts.showTextWall(
+              `🎯 Quest Location Nearby!\nYou're ${distanceInMeters}m away from your quest destination!`,
+              { durationMs: 3000 }
+            );
           } else {
-            const distanceText = distance < 1 
-              ? `${distanceInMeters}m` 
-              : `${distance.toFixed(1)}km`;
-            
+            const distanceText =
+              distance < 1
+                ? `${distanceInMeters}m`
+                : `${distance.toFixed(1)}km`;
+
             session.layouts.showTextWall(
               `📍 Quest Distance: ${distanceText}\nto your quest destination`,
               { durationMs: 3000 }
             );
-            
-            // Audio notification for distance
-            const audioDistance = distance < 1 
-              ? `${distanceInMeters} meters` 
-              : `${distance.toFixed(1)} kilometers`;
-            await this.playTTSWithDebounce(session, `You are ${audioDistance} from your quest destination.`, {
-              voice_settings: {
-                stability: 0.7,
-                similarity_boost: 0.8,
-                speed: 1.0
-              }
-            });
           }
         }
       }
@@ -849,12 +944,13 @@ class ExampleMentraOSApp extends AppServer {
           // Show distance to quest location with throttling
           const distanceInMeters = Math.round(distance * 1000);
           const now = Date.now();
-          const lastNotification = this.lastDistanceNotificationMap.get(userId) || 0;
-          
+          const lastNotification =
+            this.lastDistanceNotificationMap.get(userId) || 0;
+
           // Show distance notification every 6 seconds, using TextWall for better visibility
           if (now - lastNotification > 6000) {
             this.lastDistanceNotificationMap.set(userId, now);
-            
+
             // If within 100 meters of quest location, notify user they're close
             if (distance <= 0.1) {
               // 0.1 km = 100 meters
@@ -864,21 +960,22 @@ class ExampleMentraOSApp extends AppServer {
               );
             } else {
               // Show distance for locations further away
-              const distanceText = distance < 1 
-                ? `${distanceInMeters}m` 
-                : `${distance.toFixed(1)}km`;
-              
+              const distanceText =
+                distance < 1
+                  ? `${distanceInMeters}m`
+                  : `${distance.toFixed(1)}km`;
+
               session.layouts.showTextWall(
                 `📍 Quest Distance: ${distanceText}\nto your quest destination`,
                 { durationMs: 2000 }
               );
             }
-            
+
             // Also log the distance for debugging
             session.logger.info("Distance to quest", {
               distanceKm: distance,
               distanceMeters: distanceInMeters,
-              questTitle: questTemplate.title
+              questTitle: questTemplate.title,
             });
           }
         }

@@ -294,6 +294,21 @@ export class QuestDatabase {
     });
   }
 
+  async abandonQuest(questId: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const abandoned_at = new Date().toISOString();
+
+      this.db.run(
+        `UPDATE active_quests SET status = 'abandoned', completed_at = ? WHERE id = ?`,
+        [abandoned_at, questId],
+        (err) => {
+          if (err) reject(err);
+          else resolve();
+        }
+      );
+    });
+  }
+
   // POI cache operations
   async cachePOI(poi: Omit<POICache, 'id' | 'last_updated'>): Promise<POICache> {
     return new Promise((resolve, reject) => {
@@ -325,6 +340,24 @@ export class QuestDatabase {
         (err, rows: POICache[]) => {
           if (err) reject(err);
           else resolve(rows || []);
+        }
+      );
+    });
+  }
+
+  async getRecentQuestCategories(userId: string, limit: number = 3): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+      this.db.all(
+        `SELECT DISTINCT qt.category
+         FROM active_quests aq
+         JOIN quest_templates qt ON aq.quest_template_id = qt.id
+         WHERE aq.user_id = ? AND aq.status = 'completed'
+         ORDER BY aq.completed_at DESC
+         LIMIT ?`,
+        [userId, limit],
+        (err, rows: { category: string }[]) => {
+          if (err) reject(err);
+          else resolve(rows.map(row => row.category));
         }
       );
     });

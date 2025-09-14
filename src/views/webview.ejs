@@ -4,25 +4,225 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MentraOS Example App</title>
+  <title>POI Quest App</title>
   <link rel="stylesheet" href="/css/style.css">
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      color: white;
+    }
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+      background: rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(10px);
+      border-radius: 20px;
+      padding: 30px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 30px;
+    }
+    .header h1 {
+      margin: 0;
+      font-size: 2.5em;
+      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+    }
+    .user-info {
+      background: rgba(255, 255, 255, 0.15);
+      padding: 15px;
+      border-radius: 10px;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    .quest-section {
+      background: rgba(255, 255, 255, 0.1);
+      padding: 20px;
+      border-radius: 15px;
+      margin-bottom: 20px;
+    }
+    .quest-section h2 {
+      margin-top: 0;
+      color: #FFD700;
+    }
+    .quest-details {
+      background: rgba(0, 0, 0, 0.2);
+      padding: 15px;
+      border-radius: 10px;
+      margin: 15px 0;
+      font-family: 'Courier New', monospace;
+      line-height: 1.4;
+    }
+    .button {
+      background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
+      color: white;
+      border: none;
+      padding: 15px 30px;
+      border-radius: 25px;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+      margin: 10px;
+      box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+    }
+    .button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+    }
+    .button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .button.complete {
+      background: linear-gradient(45deg, #56CCF2, #2F80ED);
+    }
+    .button.new {
+      background: linear-gradient(45deg, #F093FB, #F5576C);
+    }
+    .button.reroll {
+      background: linear-gradient(45deg, #FFA726, #FF7043);
+    }
+    .controls {
+      text-align: center;
+      margin-top: 20px;
+    }
+    .loading {
+      display: none;
+      text-align: center;
+      margin: 20px 0;
+    }
+    .spinner {
+      border: 3px solid rgba(255, 255, 255, 0.3);
+      border-radius: 50%;
+      border-top: 3px solid #FFD700;
+      width: 30px;
+      height: 30px;
+      animation: spin 1s linear infinite;
+      margin: 0 auto;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
 </head>
 
 <body>
   <div class="container">
-    <header>
-      <h1>MentraOS Example App</h1>
-    </header>
-    <div class="instructions">
+    <div class="header">
+      <h1>🎮 POI Quest App</h1>
+    </div>
+
+    <div class="user-info">
       <% if (userId) { %>
-        <p>Logged in as: <span class="user-id">
-            <%= userId %>
-          </span></p>
+        <p><strong>Logged in as:</strong> <%= userId %></p>
+        <% if (userStats) { %>
+          <p><strong>💰 Total Points:</strong> <%= userStats.total_points %> | <strong>🏆 Quests Completed:</strong> <%= userStats.quests_completed %></p>
+        <% } %>
+      <% } else { %>
+        <p>⚠️ Not logged in</p>
+      <% } %>
+    </div>
+
+    <div class="quest-section">
+      <h2>🎯 Current Quest</h2>
+      <div id="quest-display">
+        <% if (currentQuest && questTemplate) { %>
+          <div class="quest-details">
+            <strong><%= questTemplate.title %></strong><br><br>
+            <%= questTemplate.description %><br><br>
+            <strong>📍 Location:</strong> <%= questTemplate.location_name %><br>
+            <%= questTemplate.location_address %><br><br>
+            <strong>🏆 Points:</strong> <%= questTemplate.points %>
+          </div>
         <% } else { %>
-          <p>Not logged in</p>
-          <% } %>
+          <p>No active quest. Get a new quest to start your adventure!</p>
+        <% } %>
+      </div>
+
+      <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <p>Processing...</p>
+      </div>
+
+      <div class="controls">
+        <% if (currentQuest) { %>
+          <button class="button complete" onclick="completeQuest()">✅ Complete Quest</button>
+          <button class="button reroll" onclick="rerollQuest()">🔄 Reroll Quest</button>
+        <% } else { %>
+          <button class="button new" onclick="getNewQuest()">🎯 Get New Quest</button>
+        <% } %>
+
+        <% if (currentQuest) { %>
+          <button class="button" onclick="refreshQuest()">📍 Show Current Quest</button>
+        <% } %>
+      </div>
     </div>
   </div>
+
+  <script>
+    async function apiCall(endpoint, method = 'POST') {
+      const loading = document.getElementById('loading');
+      loading.style.display = 'block';
+
+      try {
+        const response = await fetch(endpoint, {
+          method: method,
+          headers: {
+            'Content-Type': 'application/json',
+          }
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+          // Reload the page to show updated quest state
+          window.location.reload();
+        } else {
+          alert('Error: ' + (result.message || 'Something went wrong'));
+        }
+      } catch (error) {
+        console.error('API Error:', error);
+        alert('Error: Unable to communicate with server');
+      } finally {
+        loading.style.display = 'none';
+      }
+    }
+
+    function getNewQuest() {
+      apiCall('/api/quest/new');
+    }
+
+    function completeQuest() {
+      if (confirm('Are you sure you want to complete this quest?')) {
+        apiCall('/api/quest/complete');
+      }
+    }
+
+    function rerollQuest() {
+      if (confirm('Are you sure you want to abandon your current quest and get a new one?')) {
+        apiCall('/api/quest/reroll');
+      }
+    }
+
+    function refreshQuest() {
+      apiCall('/api/quest/current', 'GET');
+    }
+
+    // Auto-refresh every 30 seconds to show updated quest state
+    setInterval(() => {
+      if (!document.getElementById('loading').style.display === 'block') {
+        window.location.reload();
+      }
+    }, 30000);
+  </script>
 </body>
 
 </html>
