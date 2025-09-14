@@ -45,6 +45,26 @@ class ExampleMentraOSApp extends AppServer {
 
     // Set up Express routes
     setupExpressRoutes(this);
+
+    // Set up daily streak reset check (every hour)
+    this.streakResetInterval = setInterval(async () => {
+      try {
+        await this.database.resetExpiredStreaks();
+        console.log('Daily streak reset check completed');
+      } catch (error) {
+        console.error('Error during streak reset:', error);
+      }
+    }, 60 * 60 * 1000); // Check every hour
+  }
+
+  /**
+   * Cleanup method to stop all intervals
+   */
+  private cleanupIntervals(): void {
+    if (this.streakResetInterval) {
+      clearInterval(this.streakResetInterval);
+      this.streakResetInterval = null;
+    }
   }
 
   /** Map to store active user sessions */
@@ -61,6 +81,9 @@ class ExampleMentraOSApp extends AppServer {
 
   /** Map to store periodic distance update intervals */
   private distanceUpdateIntervals = new Map<string, NodeJS.Timeout>();
+
+  /** Interval for daily streak reset check */
+  private streakResetInterval: NodeJS.Timeout | null = null;
 
   /**
    * Get a random quest template from database
@@ -334,9 +357,13 @@ class ExampleMentraOSApp extends AppServer {
         questsCompleted: user.quests_completed,
       });
 
-      // Show welcome message with user stats
+      // Show welcome message with user stats including streak
+      const streakText = user.daily_quest_count > 0 
+        ? `🔥 Today's Quests: ${user.daily_quest_count}\n🏆 Best Day: ${user.max_daily_quests} quests\n`
+        : `🔥 Start your daily quest streak!\n`;
+      
       session.layouts.showTextWall(
-        `🎮 POI Quest App loaded!\n\n👤 Total Points: ${user.total_points}\n🏆 Quests Completed: ${user.quests_completed}\n\nSay 'new quest' to begin your adventure!`,
+        `🎮 POI Quest App loaded!\n\n👤 Total Points: ${user.total_points}\n🏆 Quests Completed: ${user.quests_completed}\n${streakText}\nSay 'new quest' to begin your adventure!`,
         { durationMs: 5000 }
       );
     } catch (error) {
@@ -514,6 +541,35 @@ class ExampleMentraOSApp extends AppServer {
         // Show current distance to quest
         await this.showDistanceCardForUser(userId, session);
       } else if (
+        normalizedText.includes("show progress") ||
+        normalizedText.includes("my streak") ||
+        normalizedText.includes("streak stats")
+      ) {
+        // Show streak information
+        try {
+          const user = await this.database.getUser(userId);
+          if (user) {
+            const streakMessage = user.daily_quest_count > 0 
+              ? `🔥 Today's Quests: ${user.daily_quest_count}\n🏆 Best Day Ever: ${user.max_daily_quests} quests\n\nKeep it up!`
+              : `🔥 No quests completed today yet!\n🏆 Best Day Ever: ${user.max_daily_quests} quests\n\nSay 'new quest' to start your streak!`;
+            
+            session.layouts.showReferenceCard(
+              "🔥 Quest Streak Stats",
+              streakMessage,
+              { durationMs: 4000 }
+            );
+          } else {
+            session.layouts.showTextWall("User not found. Please try again.", {
+              durationMs: 3000,
+            });
+          }
+        } catch (error) {
+          session.logger.error("Error fetching streak stats", { error });
+          session.layouts.showTextWall("Error fetching streak stats. Please try again.", {
+            durationMs: 3000,
+          });
+        }
+      } else if (
         normalizedText.includes("complete quest") ||
         normalizedText.includes("finish quest") ||
         normalizedText.includes("done quest")
@@ -532,6 +588,12 @@ class ExampleMentraOSApp extends AppServer {
             // Get updated user stats
             const user = await this.database.getUser(userId);
 
+            // Get updated user data to show current streak
+            const updatedUser = await this.database.getUser(userId);
+            const streakText = updatedUser && updatedUser.daily_quest_count > 0 
+              ? `\n🔥 Today's Quests: ${updatedUser.daily_quest_count} | Best Day: ${updatedUser.max_daily_quests} quests`
+              : '';
+
             session.layouts.showReferenceCard(
               "🎉 Quest Completed!",
               `Congratulations! You earned ${points} points for completing "${
@@ -540,7 +602,7 @@ class ExampleMentraOSApp extends AppServer {
                 user?.total_points || 0
               }\n🏆 Quests Completed: ${
                 user?.quests_completed || 0
-              }\n\nSay 'new quest' for your next adventure.`,
+              }${streakText}\n\nSay 'new quest' for your next adventure.`,
               { durationMs: 5000 }
             );
 
@@ -767,5 +829,18 @@ class ExampleMentraOSApp extends AppServer {
 
 // Start the server
 const app = new ExampleMentraOSApp();
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.log('Shutting down gracefully...');
+  (app as any).cleanupIntervals();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('Shutting down gracefully...');
+  (app as any).cleanupIntervals();
+  process.exit(0);
+});
 
 app.start().catch(console.error);
