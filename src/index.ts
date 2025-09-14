@@ -84,6 +84,102 @@ class ExampleMentraOSApp extends AppServer {
   /** Map to track when scrolling text is active for each user */
   private scrollingTextActive = new Map<string, boolean>();
 
+  /** TTS debounce system */
+  private lastTTSTimeMap = new Map<string, number>(); // Track last TTS time for debouncing
+  private activeTTSMap = new Map<string, boolean>(); // Track if TTS is currently playing for a user
+
+  /**
+   * Play TTS with debounce protection to prevent overlapping audio
+   * @param session - The app session
+   * @param text - Text to speak
+   * @param options - Voice settings options
+   * @param forcePlay - Whether to bypass debounce (for critical messages)
+   * @returns Promise<boolean> - Whether TTS was played
+   */
+  private async playTTSWithDebounce(
+    session: AppSession,
+    text: string,
+    options?: {
+      voice_id?: string;
+      model_id?: string;
+      voice_settings?: {
+        stability?: number;
+        similarity_boost?: number;
+        style?: number;
+        use_speaker_boost?: boolean;
+        speed?: number;
+      };
+    },
+    forcePlay: boolean = false
+  ): Promise<boolean> {
+    const userId = Array.from(this.userSessionsMap.entries())
+      .find(([_, sess]) => sess === session)?.[0];
+    
+    if (!userId) return false;
+    
+    const now = Date.now();
+    const lastTTSTime = this.lastTTSTimeMap.get(userId) || 0;
+    const isCurrentlyPlaying = this.activeTTSMap.get(userId) || false;
+    const debounceDelay = 2000; // 2 seconds debounce
+    
+    // Check if we should play TTS
+    const timeSinceLastTTS = now - lastTTSTime;
+    const shouldPlay = forcePlay || (!isCurrentlyPlaying && timeSinceLastTTS > debounceDelay);
+    
+    if (!shouldPlay) {
+      session.logger.info("TTS skipped due to debounce", {
+        timeSinceLastTTS,
+        isCurrentlyPlaying,
+        forcePlay,
+        text: text.substring(0, 30) + "..."
+      });
+      return false;
+    }
+    
+    try {
+      // Mark as playing and update timestamp BEFORE starting TTS
+      this.activeTTSMap.set(userId, true);
+      this.lastTTSTimeMap.set(userId, now);
+      
+      // Use proper AudioManager API with default settings optimized for real-time use
+      const ttsOptions = {
+        model_id: 'eleven_flash_v2_5', // Ultra-fast model for real-time use
+        voice_settings: {
+          stability: 0.7,
+          similarity_boost: 0.8,
+          speed: 1.0,
+          ...options?.voice_settings
+        },
+        ...options
+      };
+      
+      const result = await session.audio.speak(text, ttsOptions);
+      
+      if (result.success) {
+        session.logger.info("TTS played successfully", { 
+          text: text.substring(0, 50) + "...",
+          duration: result.duration 
+        });
+        
+        // Keep the debounce active for a short period after TTS completes
+        setTimeout(() => {
+          this.activeTTSMap.set(userId, false);
+        }, 500); // 500ms buffer after TTS completes
+        
+        return true;
+      } else {
+        session.logger.warn("TTS failed", { error: result.error, text: text.substring(0, 50) + "..." });
+        this.activeTTSMap.set(userId, false);
+        return false;
+      }
+    } catch (error) {
+      session.logger.warn("Failed to play TTS", { error, text: text.substring(0, 50) + "..." });
+      // Reset immediately on error
+      this.activeTTSMap.set(userId, false);
+      return false;
+    }
+  }
+
   /**
    * Get a random quest template from database
    */
@@ -569,6 +665,9 @@ class ExampleMentraOSApp extends AppServer {
           let questTemplate: QuestTemplate | null = null;
 
           if (userLocation) {
+            await this.playTTSWithDebounce(session, "Finding your next adventure!", {
+              voice_settings: { stability: 0.6, speed: 1.1 }
+            });
             session.layouts.showTextWall(
               "🔍 AI is analyzing your surroundings for the perfect adventure...",
               {
@@ -582,6 +681,9 @@ class ExampleMentraOSApp extends AppServer {
               session
             );
           } else {
+            await this.playTTSWithDebounce(session, "Finding your next adventure!", {
+              voice_settings: { stability: 0.6, speed: 1.1 }
+            });
             session.logger.info("No location available, using random quest");
             questTemplate = await this.getRandomQuestTemplate();
           }
@@ -681,6 +783,21 @@ class ExampleMentraOSApp extends AppServer {
             // Get updated user stats
             const user = await this.database.getUser(userId);
 
+            // Play celebration audio
+            await this.playTTSWithDebounce(
+              session,
+              `Quest completed! You earned ${points} points. Your total is now ${user?.total_points || 0} points.`,
+              {
+                voice_settings: {
+                  stability: 0.4,
+                  similarity_boost: 0.85,
+                  style: 0.8,
+                  speed: 1.0
+                }
+              },
+              true // Force play for quest completion
+            );
+
             this.displayScrollingText(
               session,
               "🎉 Quest Completed!",
@@ -713,6 +830,24 @@ class ExampleMentraOSApp extends AppServer {
           );
         }
       } else if (
+        normalizedText.includes("show leaderboard") ||
+        normalizedText.includes("get leaderboard") ||
+        normalizedText.includes("rankings") ||
+        normalizedText.includes("leaderboard")
+      ) {
+        try {
+          await this.playTTSWithDebounce(session, "Checking the rankings...", {
+            voice_settings: { stability: 0.6, speed: 1.1 }
+          });
+          await this.showLeaderboard(session);
+        } catch (error) {
+          session.logger.error("Error showing leaderboard", { error });
+          session.layouts.showTextWall(
+            "Error loading leaderboard. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
         normalizedText.includes("reroll quest") ||
         normalizedText.includes("re-roll quest") ||
         normalizedText.includes("new quest please") ||
@@ -732,6 +867,10 @@ class ExampleMentraOSApp extends AppServer {
 
           // Mark current quest as abandoned
           await this.database.abandonQuest(existingQuest.id);
+
+          await this.playTTSWithDebounce(session, "Getting you a different adventure...", {
+            voice_settings: { stability: 0.6, speed: 1.1 }
+          });
 
           session.layouts.showTextWall(
             "🔄 Quest abandoned. Getting you a new adventure...",
@@ -853,10 +992,61 @@ class ExampleMentraOSApp extends AppServer {
       // Clear scrolling text state
       this.scrollingTextActive.delete(userId);
 
+      // Clean up TTS tracking
+      this.lastTTSTimeMap.delete(userId);
+      this.activeTTSMap.delete(userId);
+
       if (stopLocationUpdates) {
         stopLocationUpdates();
       }
     });
+  }
+
+  /**
+   * Show leaderboard with all users' points, enumerated rankings, and scrolling
+   */
+  private async showLeaderboard(session: AppSession): Promise<void> {
+    try {
+      const users = await this.database.getAllUsersLeaderboard();
+      
+      if (users.length === 0) {
+        session.layouts.showTextWall(
+          "🏆 Leaderboard\n\nNo users found yet!\nComplete some quests to appear on the leaderboard.",
+          { durationMs: 4000 }
+        );
+        return;
+      }
+
+      // Build leaderboard content with enumerated rankings
+      let leaderboardContent = "";
+      
+      users.forEach((user, index) => {
+        const rank = index + 1;
+        const userId = user.id.length > 32 ? `${user.id.substring(0, 29)}...` : user.id;
+        
+        leaderboardContent += `${rank}. ${userId}\n`;
+        leaderboardContent += `   ${user.total_points} pts | ${user.quests_completed} quests\n\n`;
+      });
+
+      // Use displayScrollingText for proper scrolling behavior
+      await this.displayScrollingText(
+        session,
+        "🏆 Quest Leaderboard",
+        leaderboardContent.trim()
+      );
+
+      session.logger.info("Leaderboard displayed", {
+        totalUsers: users.length,
+        topUser: users[0]?.id,
+        topPoints: users[0]?.total_points
+      });
+    } catch (error) {
+      session.logger.error("Error showing leaderboard", { error });
+      session.layouts.showTextWall(
+        "Error loading leaderboard. Please try again.",
+        { durationMs: 3000 }
+      );
+    }
   }
 
   /**

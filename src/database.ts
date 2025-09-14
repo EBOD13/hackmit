@@ -345,6 +345,24 @@ export class QuestDatabase {
     });
   }
 
+  async getAllUsersLeaderboard(): Promise<Array<{id: string, total_points: number, quests_completed: number}>> {
+    return new Promise((resolve, reject) => {
+      this.db.all(
+        `SELECT id, total_points, quests_completed 
+         FROM users 
+         ORDER BY total_points DESC, quests_completed DESC`,
+        [],
+        (err, rows: any[]) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(rows || []);
+          }
+        }
+      );
+    });
+  }
+
   async getRecentQuestCategories(userId: string, limit: number = 3): Promise<string[]> {
     return new Promise((resolve, reject) => {
       this.db.all(
