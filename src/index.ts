@@ -1,4 +1,4 @@
-import { ToolCall, AppServer, AppSession } from '@mentra/sdk';
+﻿import { ToolCall, AppServer, AppSession } from '@mentra/sdk';
 import path from "path";
 import { setupExpressRoutes } from "./webview";
 import { handleToolCall } from "./tools";
@@ -59,8 +59,71 @@ class ExampleMentraOSApp extends AppServer {
   /** Map to store last distance notification time to prevent spam */
   private lastDistanceNotificationMap = new Map<string, number>();
 
-  /** Map to store periodic distance update intervals */
-  private distanceUpdateIntervals = new Map<string, NodeJS.Timeout>();
+  private questTTSPlayedMap = new Map<string, string>(); // Track which quests have had TTS played
+
+  private lastTTSTimeMap = new Map<string, number>(); // Track last TTS time for debouncing
+  private activeTTSMap = new Map<string, boolean>(); // Track if TTS is currently playing for a user
+
+  /**
+   * Play TTS with debounce protection to prevent overlapping audio
+   * @param session - The app session
+   * @param text - Text to speak
+   * @param options - Voice settings options
+   * @param forcePlay - Whether to bypass debounce (for critical messages)
+   * @returns Promise<boolean> - Whether TTS was played
+   */
+  private async playTTSWithDebounce(
+    session: AppSession,
+    text: string,
+    options?: any,
+    forcePlay: boolean = false
+  ): Promise<boolean> {
+    const userId = Array.from(this.userSessionsMap.entries())
+      .find(([_, sess]) => sess === session)?.[0];
+    
+    if (!userId) return false;
+    
+    const now = Date.now();
+    const lastTTSTime = this.lastTTSTimeMap.get(userId) || 0;
+    const isCurrentlyPlaying = this.activeTTSMap.get(userId) || false;
+    const debounceDelay = 2000; // 2 seconds debounce
+    
+    // Check if we should play TTS
+    const timeSinceLastTTS = now - lastTTSTime;
+    const shouldPlay = forcePlay || (!isCurrentlyPlaying && timeSinceLastTTS > debounceDelay);
+    
+    if (!shouldPlay) {
+      session.logger.info("TTS skipped due to debounce", {
+        timeSinceLastTTS,
+        isCurrentlyPlaying,
+        forcePlay,
+        text: text.substring(0, 30) + "..."
+      });
+      return false;
+    }
+    
+    try {
+      // Mark as playing and update timestamp BEFORE starting TTS
+      this.activeTTSMap.set(userId, true);
+      this.lastTTSTimeMap.set(userId, now);
+      
+      await session.audio.speak(text, options);
+      
+      session.logger.info("TTS played successfully", { text: text.substring(0, 50) + "..." });
+      
+      // Keep the debounce active for a short period after TTS completes
+      setTimeout(() => {
+        this.activeTTSMap.set(userId, false);
+      }, 500); // 500ms buffer after TTS completes
+      
+      return true;
+    } catch (error) {
+      session.logger.warn("Failed to play TTS", { error, text: text.substring(0, 50) + "..." });
+      // Reset immediately on error
+      this.activeTTSMap.set(userId, false);
+      return false;
+    }
+  }
 
   /**
    * Get a random quest template from database
@@ -185,12 +248,6 @@ class ExampleMentraOSApp extends AppServer {
     const userId = Array.from(this.userSessionsMap.entries())
       .find(([_, sess]) => sess === session)?.[0];
     
-    // Schedule distance card to show after 10 seconds
-    if (userId) {
-      setTimeout(() => {
-        this.showDistanceCardForUser(userId, session);
-      }, 10000);
-    }
     const lines = this.wrapText(content);
     console.log("Wrapped lines:", lines.join("\n"));
 
@@ -272,10 +329,11 @@ class ExampleMentraOSApp extends AppServer {
       questContent
     );
 
+
     session.logger.info("Quest displayed", {
       questId: questTemplate.id,
       title: questTemplate.title,
-      category: questTemplate.category,
+      category: questTemplate.category
     });
   }
 
@@ -380,16 +438,6 @@ class ExampleMentraOSApp extends AppServer {
     } catch (error) {
       session.logger.warn("Failed to start location tracking", { error });
     }
-
-    // Set up periodic distance updates every 30 seconds
-    const distanceInterval = setInterval(() => {
-      this.showDistanceCardForUser(userId, session).catch((error) => {
-        session.logger.warn("Error in periodic distance update", { error });
-      });
-    }, 30000);
-    
-    this.distanceUpdateIntervals.set(userId, distanceInterval);
-    session.logger.info("Location tracking and periodic distance updates started");
 
     /**
      * Handles quest-related voice commands
@@ -508,15 +556,8 @@ class ExampleMentraOSApp extends AppServer {
           );
         }
       } else if (
-        normalizedText.includes("show distance") ||
-        normalizedText.includes("how far")
-      ) {
-        // Show current distance to quest
-        await this.showDistanceCardForUser(userId, session);
-      } else if (
         normalizedText.includes("complete quest") ||
-        normalizedText.includes("finish quest") ||
-        normalizedText.includes("done quest")
+        normalizedText.includes("finish quest")
       ) {
         try {
           const activeQuest = await this.database.getUserActiveQuest(userId);
@@ -531,6 +572,21 @@ class ExampleMentraOSApp extends AppServer {
 
             // Get updated user stats
             const user = await this.database.getUser(userId);
+
+            // Play celebration audio
+            await this.playTTSWithDebounce(
+              session,
+              `Quest completed! You earned ${points} points. Your total is now ${user?.total_points || 0} points.`,
+              {
+                voice_settings: {
+                  stability: 0.4,
+                  similarity_boost: 0.85,
+                  style: 0.8,
+                  speed: 1.0
+                }
+              },
+              true // Force play for quest completion
+            );
 
             session.layouts.showReferenceCard(
               "🎉 Quest Completed!",
@@ -588,6 +644,36 @@ class ExampleMentraOSApp extends AppServer {
         displayTranscription(data.text);
         // Handle quest commands first
         await handleQuestCommands(data.text);
+        
+        // Handle voice commands
+        const lowerText = data.text.toLowerCase().trim();
+        
+        // Get userId for debouncing
+        const userId = Array.from(this.userSessionsMap.entries())
+          .find(([_, sess]) => sess === session)?.[0];
+        
+        if (userId) {
+          
+          if (lowerText.includes("new quest") || lowerText.includes("next quest")) {
+            await this.playTTSWithDebounce(session, "Finding your next adventure!", {
+              voice_settings: { stability: 0.6, speed: 1.1 }
+            });
+          } else if (lowerText.includes("complete quest") || lowerText.includes("finish quest")) {
+            // No TTS confirmation for quest completion
+          } else if (lowerText.includes("show distance") || lowerText.includes("how far")) {
+            await this.playTTSWithDebounce(session, "Calculating your location...", {
+              voice_settings: { stability: 0.6, speed: 1.1 }
+            });
+            // Show distance to quest location
+            await this.showDistanceCardForUser(userId, session);
+          } else if (lowerText.includes("show leaderboard") || lowerText.includes("get leaderboard") || lowerText.includes("rankings")) {
+            await this.playTTSWithDebounce(session, "Checking the rankings...", {
+              voice_settings: { stability: 0.6, speed: 1.1 }
+            });
+            // Always execute the leaderboard command regardless of TTS debounce
+            await this.showLeaderboard(session);
+          }
+        }
       }
     });
 
@@ -610,19 +696,64 @@ class ExampleMentraOSApp extends AppServer {
     this.addCleanupHandler(() => {
       this.userSessionsMap.delete(userId);
       this.userLocationsMap.delete(userId);
-      
-      // Clear periodic distance updates
-      const distanceInterval = this.distanceUpdateIntervals.get(userId);
-      if (distanceInterval) {
-        clearInterval(distanceInterval);
-        this.distanceUpdateIntervals.delete(userId);
-      }
+      this.questTTSPlayedMap.delete(userId); // Clean up TTS tracking
+      this.lastTTSTimeMap.delete(userId); // Clean up TTS debounce tracking
+      this.activeTTSMap.delete(userId); // Clean up active TTS tracking
       
       if (stopLocationUpdates) {
         stopLocationUpdates();
       }
     });
   }
+
+  /**
+   * Show leaderboard with all users' points
+   */
+  private async showLeaderboard(session: AppSession): Promise<void> {
+    try {
+      const users = await this.database.getAllUsersLeaderboard();
+      
+      if (users.length === 0) {
+        session.layouts.showTextWall(
+          "🏆 Leaderboard\n\nNo users found yet!\nComplete some quests to appear on the leaderboard.",
+          { durationMs: 4000 }
+        );
+        return;
+      }
+
+      // Build leaderboard content
+      let leaderboardContent = "🏆 Quest Leaderboard\n\n";
+      
+      users.forEach((user, index) => {
+        const rank = index + 1;
+        const medal = rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : `${rank}.`;
+        const userId = user.id.length > 12 ? `${user.id.substring(0, 12)}...` : user.id;
+        
+        leaderboardContent += `${medal} ${userId}\n`;
+        leaderboardContent += `   Points: ${user.total_points}\n\n`;
+      });
+
+      // Use scrolling display for long leaderboards
+      await this.displayScrollingText(
+        session,
+        "🏆 Quest Leaderboard",
+        leaderboardContent.trim()
+      );
+
+      session.logger.info("Leaderboard displayed", {
+        totalUsers: users.length,
+        topUser: users[0]?.id,
+        topPoints: users[0]?.total_points
+      });
+    } catch (error) {
+      session.logger.error("Error showing leaderboard", { error });
+      session.layouts.showTextWall(
+        "Error loading leaderboard. Please try again.",
+        { durationMs: 3000 }
+      );
+    }
+  }
+
 
   /**
    * Show distance card for a specific user
@@ -647,10 +778,18 @@ class ExampleMentraOSApp extends AppServer {
           const distanceInMeters = Math.round(distance * 1000);
           
           if (distance <= 0.1) {
-            session.layouts.showTextWall(
-              `🎯 Quest Location Nearby!\nYou're ${distanceInMeters}m away from your quest destination!`,
-              { durationMs: 3000 }
-            );
+            const message = `🎯 Quest Location Nearby!\nYou're ${distanceInMeters}m away from your quest destination!`;
+            session.layouts.showTextWall(message, { durationMs: 3000 });
+            
+            // Audio notification for nearby location
+            await this.playTTSWithDebounce(session, `You're very close! Only ${distanceInMeters} meters to your quest destination.`, {
+              voice_settings: {
+                stability: 0.5,
+                similarity_boost: 0.8,
+                style: 0.7,
+                speed: 1.1
+              }
+            });
           } else {
             const distanceText = distance < 1 
               ? `${distanceInMeters}m` 
@@ -660,6 +799,18 @@ class ExampleMentraOSApp extends AppServer {
               `📍 Quest Distance: ${distanceText}\nto your quest destination`,
               { durationMs: 3000 }
             );
+            
+            // Audio notification for distance
+            const audioDistance = distance < 1 
+              ? `${distanceInMeters} meters` 
+              : `${distance.toFixed(1)} kilometers`;
+            await this.playTTSWithDebounce(session, `You are ${audioDistance} from your quest destination.`, {
+              voice_settings: {
+                stability: 0.7,
+                similarity_boost: 0.8,
+                speed: 1.0
+              }
+            });
           }
         }
       }
