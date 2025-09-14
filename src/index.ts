@@ -1,14 +1,14 @@
-﻿import { ToolCall, AppServer, AppSession } from "@mentra/sdk";
+import { ToolCall, AppServer, AppSession } from "@mentra/sdk";
 import path from "path";
 import { setupExpressRoutes } from "./webview";
 import { handleToolCall } from "./tools";
-import { QuestDatabase, User, QuestTemplate, ActiveQuest } from "./database";
-import { GooglePlacesService, QuestLocation } from "./places-service";
-import {
-  AIQuestGenerator,
-  QuestContext,
-  AIGeneratedQuest,
-} from "./ai-quest-generator";
+import { QuestDatabase, QuestTemplate, ActiveQuest, User } from "./database";
+import { GooglePlacesService } from "./places-service";
+import { WeatherService } from './weather-service';
+import { BusinessHoursService } from './business-hours-service';
+import { CompetitionService } from './competition-service';
+import { AIQuestGenerator, QuestContext, AIGeneratedQuest } from "./ai-quest-generator";
+import { SampleQuestSeeder } from "./sample-quests";
 
 const PACKAGE_NAME =
   process.env.PACKAGE_NAME ??
@@ -38,6 +38,7 @@ class ExampleMentraOSApp extends AppServer {
   private database: QuestDatabase;
   private placesService: GooglePlacesService;
   private aiQuestGenerator: AIQuestGenerator;
+  private competitionService: CompetitionService;
 
   constructor() {
     super({
@@ -61,6 +62,9 @@ class ExampleMentraOSApp extends AppServer {
       ANTHROPIC_API_KEY,
       WEATHER_API_KEY
     );
+
+    // Set up competition service
+    this.competitionService = new CompetitionService();
 
     // Set up Express routes
     setupExpressRoutes(this);
@@ -276,7 +280,12 @@ class ExampleMentraOSApp extends AppServer {
         );
       }
 
-      // Create quest template in database
+      // Get weather recommendations for the quest
+      const weatherRecommendations = questContext.weather 
+        ? await this.aiQuestGenerator.getWeatherRecommendations(lat, lng)
+        : [];
+
+      // Create quest template in database with weather data
       const questTemplate = await this.database.createQuestTemplate({
         title: aiQuest.title,
         description: aiQuest.description,
@@ -286,6 +295,10 @@ class ExampleMentraOSApp extends AppServer {
         location_address: selectedPOI.formatted_address,
         location_lat: selectedPOI.geometry.location.lat,
         location_lng: selectedPOI.geometry.location.lng,
+        weather_dependent: questContext.weather ? true : false,
+        suitable_weather: questContext.weather ? [questContext.weather.condition] : [],
+        indoor_activity: selectedPOI.types.includes('shopping_mall') || selectedPOI.types.includes('museum') || selectedPOI.types.includes('library'),
+        required_items: weatherRecommendations,
       });
 
       session.logger.info("Generated AI-powered quest", {
@@ -335,6 +348,12 @@ class ExampleMentraOSApp extends AppServer {
         randomLocation.questType
       );
 
+      // Get weather data for enhanced quest creation
+      const weather = await this.aiQuestGenerator.getWeather(lat, lng);
+      const weatherRecommendations = weather 
+        ? await this.aiQuestGenerator.getWeatherRecommendations(lat, lng)
+        : [];
+
       const questTemplate = await this.database.createQuestTemplate({
         title: questData.title,
         description: questData.description,
@@ -344,6 +363,10 @@ class ExampleMentraOSApp extends AppServer {
         location_address: randomLocation.place.formatted_address,
         location_lat: randomLocation.place.geometry.location.lat,
         location_lng: randomLocation.place.geometry.location.lng,
+        weather_dependent: weather ? true : false,
+        suitable_weather: weather ? [weather.condition] : [],
+        indoor_activity: randomLocation.place.types?.includes('shopping_mall') || randomLocation.place.types?.includes('museum') || false,
+        required_items: weatherRecommendations,
       });
 
       return questTemplate;
@@ -500,7 +523,45 @@ class ExampleMentraOSApp extends AppServer {
       distanceInfo = `\n📏 Distance: ${(distance * 1000).toFixed(0)}m away`;
     }
 
-    const questContent = `${questTemplate.description}\n\n📍 Location: ${questTemplate.location_name}\n${questTemplate.location_address}${distanceInfo}\n\n🏆 Points: ${questTemplate.points}`;
+    // Add weather recommendations if available
+    let weatherInfo = '';
+    if (questTemplate.required_items && questTemplate.required_items.length > 0) {
+      const items = Array.isArray(questTemplate.required_items) 
+        ? questTemplate.required_items 
+        : JSON.parse(questTemplate.required_items as string);
+      if (items.length > 0) {
+        weatherInfo = `\n\n🌤️ Recommended items: ${items.join(', ')}`;
+      }
+    }
+
+    // Add historical/cultural info if available
+    let culturalInfo = '';
+    if (questTemplate.historical_significance) {
+      culturalInfo = `\n\n🏛️ Historical note: ${questTemplate.historical_significance}`;
+    } else if (questTemplate.cultural_info) {
+      culturalInfo = `\n\n🎭 Cultural info: ${questTemplate.cultural_info}`;
+    }
+
+    // Add accessibility info if we have location data
+    let accessibilityInfo = '';
+    if (questTemplate.location_lat && questTemplate.location_lng) {
+      try {
+        const mockPOI: any = {
+          name: questTemplate.location_name,
+          formatted_address: questTemplate.location_address,
+          geometry: { location: { lat: questTemplate.location_lat, lng: questTemplate.location_lng } },
+          types: questTemplate.indoor_activity ? ['establishment'] : ['tourist_attraction'],
+          rating: null,
+          user_ratings_total: null
+        };
+        const accessibilityStatus = this.aiQuestGenerator.getAccessibilityStatus(mockPOI);
+        accessibilityInfo = `\n\n⏰ ${accessibilityStatus}`;
+      } catch (error) {
+        // Silently fail if accessibility check fails
+      }
+    }
+
+    const questContent = `${questTemplate.description}\n\n📍 Location: ${questTemplate.location_name}\n${questTemplate.location_address}${distanceInfo}\n\n🏆 Points: ${questTemplate.points}${weatherInfo}${culturalInfo}${accessibilityInfo}`;
 
     // Use scrolling display for long content
     await this.displayScrollingText(
@@ -767,7 +828,8 @@ class ExampleMentraOSApp extends AppServer {
         }
       } else if (
         normalizedText.includes("complete quest") ||
-        normalizedText.includes("finish quest")
+        normalizedText.includes("finish quest") ||
+        normalizedText.includes("end quest")
       ) {
         try {
           const activeQuest = await this.database.getUserActiveQuest(userId);
@@ -975,6 +1037,96 @@ class ExampleMentraOSApp extends AppServer {
             { durationMs: 3000 }
           );
         }
+      } else if (
+        normalizedText.includes("challenges") ||
+        normalizedText.includes("community challenges") ||
+        normalizedText.includes("weekly challenge") ||
+        normalizedText.includes("monthly challenge")
+      ) {
+        try {
+          await this.playTTSWithDebounce(session, "Loading community challenges...", {
+            voice_settings: { stability: 0.6, speed: 1.1 },
+          });
+          await this.showChallenges(session, userId);
+        } catch (error) {
+          session.logger.error("Error showing challenges", { error });
+          session.layouts.showTextWall(
+            "Error loading challenges. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
+        normalizedText.includes("teams") ||
+        normalizedText.includes("my team") ||
+        normalizedText.includes("join team") ||
+        normalizedText.includes("team competition")
+      ) {
+        try {
+          await this.playTTSWithDebounce(session, "Checking team information...", {
+            voice_settings: { stability: 0.6, speed: 1.1 },
+          });
+          await this.showTeams(session, userId);
+        } catch (error) {
+          session.logger.error("Error showing teams", { error });
+          session.layouts.showTextWall(
+            "Error loading teams. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
+        normalizedText.includes("quest race") ||
+        normalizedText.includes("racing") ||
+        normalizedText.includes("race") ||
+        normalizedText.includes("speed challenge")
+      ) {
+        try {
+          await this.playTTSWithDebounce(session, "Loading quest races...", {
+            voice_settings: { stability: 0.6, speed: 1.1 },
+          });
+          await this.showQuestRaces(session, userId);
+        } catch (error) {
+          session.logger.error("Error showing quest races", { error });
+          session.layouts.showTextWall(
+            "Error loading quest races. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
+        normalizedText.includes("regional leaderboard") ||
+        normalizedText.includes("regional rankings") ||
+        normalizedText.includes("city leaderboard") ||
+        normalizedText.includes("local rankings")
+      ) {
+        try {
+          await this.playTTSWithDebounce(session, "Loading regional rankings...", {
+            voice_settings: { stability: 0.6, speed: 1.1 },
+          });
+          await this.showRegionalLeaderboard(session, userId);
+        } catch (error) {
+          session.logger.error("Error showing regional leaderboard", { error });
+          session.layouts.showTextWall(
+            "Error loading regional leaderboard. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
+        normalizedText.includes("my stats") ||
+        normalizedText.includes("user stats") ||
+        normalizedText.includes("achievements") ||
+        normalizedText.includes("badges")
+      ) {
+        try {
+          await this.playTTSWithDebounce(session, "Loading your statistics...", {
+            voice_settings: { stability: 0.6, speed: 1.1 },
+          });
+          await this.showUserStats(session, userId);
+        } catch (error) {
+          session.logger.error("Error showing user stats", { error });
+          session.layouts.showTextWall(
+            "Error loading statistics. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
       }
     };
 
@@ -1035,6 +1187,241 @@ class ExampleMentraOSApp extends AppServer {
         stopLocationUpdates();
       }
     });
+  }
+
+  /**
+   * Show community challenges
+   */
+  private async showChallenges(session: AppSession, userId: string): Promise<void> {
+    try {
+      const userProfile = await this.database.getUserProfile(userId);
+      const region = userProfile?.region || 'Boston';
+      const challenges = this.competitionService.getActiveChallenges(region);
+
+      if (challenges.length === 0) {
+        await this.displayScrollingText(
+          session,
+          "🏆 Community Challenges",
+          "No active challenges in your region right now. Check back later for new community goals!"
+        );
+        return;
+      }
+
+      let challengeText = "Active community challenges in your area:\n\n";
+      challenges.forEach((challenge, index) => {
+        const progress = Math.round((challenge.current_progress / challenge.target_value) * 100);
+        const timeLeft = Math.ceil((new Date(challenge.end_date).getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+        
+        challengeText += `${index + 1}. ${challenge.title}\n`;
+        challengeText += `${challenge.description}\n`;
+        challengeText += `Progress: ${challenge.current_progress}/${challenge.target_value} (${progress}%)\n`;
+        challengeText += `⏰ ${timeLeft} days left | 👥 ${challenge.participants} participants\n`;
+        challengeText += `🏆 Reward: ${challenge.reward_points} points\n\n`;
+      });
+
+      challengeText += "Say 'join challenge' to participate in community goals!";
+
+      await this.displayScrollingText(
+        session,
+        "🏆 Community Challenges",
+        challengeText
+      );
+    } catch (error) {
+      session.logger.error("Error showing challenges", { error });
+      session.layouts.showTextWall(
+        "Error loading challenges. Please try again.",
+        { durationMs: 3000 }
+      );
+    }
+  }
+
+  /**
+   * Show teams information
+   */
+  private async showTeams(session: AppSession, userId: string): Promise<void> {
+    try {
+      const userProfile = await this.database.getUserProfile(userId);
+      const region = userProfile?.region || 'Boston';
+      const teams = this.competitionService.getTeamsInRegion(region);
+
+      if (teams.length === 0) {
+        await this.displayScrollingText(
+          session,
+          "👥 Team Competition",
+          "No active teams in your region. Be the first to create one!\n\nSay 'create team' to start a new team and compete with friends!"
+        );
+        return;
+      }
+
+      let teamText = "Active teams in your area:\n\n";
+      teams.forEach((team, index) => {
+        teamText += `${index + 1}. ${team.name}\n`;
+        teamText += `${team.description}\n`;
+        teamText += `👥 ${team.members.length} members | 🏆 ${team.total_points} points\n`;
+        teamText += `📍 ${team.region} | 🎯 ${team.quest_count} quests completed\n\n`;
+      });
+
+      teamText += "Say 'join team' to become part of a team adventure!";
+
+      await this.displayScrollingText(
+        session,
+        "👥 Team Competition",
+        teamText
+      );
+    } catch (error) {
+      session.logger.error("Error showing teams", { error });
+      session.layouts.showTextWall(
+        "Error loading teams. Please try again.",
+        { durationMs: 3000 }
+      );
+    }
+  }
+
+  /**
+   * Show quest races
+   */
+  private async showQuestRaces(session: AppSession, userId: string): Promise<void> {
+    try {
+      const userProfile = await this.database.getUserProfile(userId);
+      const region = userProfile?.region || 'Boston';
+      const races = this.competitionService.getActiveQuestRaces(region);
+
+      if (races.length === 0) {
+        await this.displayScrollingText(
+          session,
+          "🏃 Quest Racing",
+          "No active quest races right now. Check back later for speed challenges!\n\nQuest races let you compete to complete the same quest fastest!"
+        );
+        return;
+      }
+
+      let raceText = "Active quest races:\n\n";
+      races.forEach((race, index) => {
+        const timeLeft = Math.ceil((new Date(race.end_time).getTime() - Date.now()) / (1000 * 60 * 60));
+        const leaderText = race.participants.find(p => p.position === 1)?.display_name || 'None yet';
+        
+        raceText += `${index + 1}. ${race.title}\n`;
+        raceText += `${race.description}\n`;
+        raceText += `👥 ${race.participants.length} participants\n`;
+        raceText += `🥇 Leader: ${leaderText}\n`;
+        raceText += `⏰ ${timeLeft} hours left\n\n`;
+      });
+
+      raceText += "Say 'join race' to compete for the fastest completion time!";
+
+      await this.displayScrollingText(
+        session,
+        "🏃 Quest Racing",
+        raceText
+      );
+    } catch (error) {
+      session.logger.error("Error showing quest races", { error });
+      session.layouts.showTextWall(
+        "Error loading quest races. Please try again.",
+        { durationMs: 3000 }
+      );
+    }
+  }
+
+  /**
+   * Show regional leaderboard
+   */
+  private async showRegionalLeaderboard(session: AppSession, userId: string): Promise<void> {
+    try {
+      const userProfile = await this.database.getUserProfile(userId);
+      const region = userProfile?.region || 'Boston';
+      const leaderboard = this.competitionService.getRegionalLeaderboard(region, 'weekly');
+
+      if (leaderboard.rankings.length === 0) {
+        await this.displayScrollingText(
+          session,
+          `🏆 ${region} Leaderboard`,
+          "No rankings available for your region yet. Complete some quests to get on the board!"
+        );
+        return;
+      }
+
+      let leaderboardText = `Top questers in ${region} this week:\n\n`;
+      leaderboard.rankings.forEach((entry, index) => {
+        const rankEmoji = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `${index + 1}.`;
+        const teamInfo = entry.team_name ? ` (${entry.team_name})` : '';
+        const badges = entry.badges.join(' ');
+        
+        leaderboardText += `${rankEmoji} ${entry.display_name}${teamInfo}\n`;
+        leaderboardText += `🏆 ${entry.points} points | 🎯 ${entry.quest_count} quests\n`;
+        if (badges) leaderboardText += `${badges}\n`;
+        leaderboardText += `\n`;
+      });
+
+      leaderboardText += `Last updated: ${leaderboard.last_updated.toLocaleString()}\n\n`;
+      leaderboardText += "Keep completing quests to climb the rankings!";
+
+      await this.displayScrollingText(
+        session,
+        `🏆 ${region} Leaderboard`,
+        leaderboardText
+      );
+    } catch (error) {
+      session.logger.error("Error showing regional leaderboard", { error });
+      session.layouts.showTextWall(
+        "Error loading regional leaderboard. Please try again.",
+        { durationMs: 3000 }
+      );
+    }
+  }
+
+  /**
+   * Show user statistics and achievements
+   */
+  private async showUserStats(session: AppSession, userId: string): Promise<void> {
+    try {
+      const userStats = this.competitionService.getUserStats(userId);
+      const achievements = await this.database.getUserAchievements(userId);
+
+      let statsText = `📊 Your Adventure Statistics\n\n`;
+      statsText += `🎯 Display Name: ${userStats.display_name}\n`;
+      statsText += `🏆 Total Points: ${userStats.total_points}\n`;
+      statsText += `📍 Quests Completed: ${userStats.quest_count}\n`;
+      statsText += `🏅 Challenges Won: ${userStats.challenges_completed}\n`;
+      statsText += `🔥 Current Streak: ${userStats.current_streak} days\n`;
+      statsText += `⭐ Best Streak: ${userStats.longest_streak} days\n`;
+      statsText += `❤️ Favorite Category: ${userStats.favorite_category}\n`;
+      
+      if (userStats.team_id) {
+        statsText += `👥 Team: Active member\n`;
+      }
+      
+      statsText += `📍 Region: ${userStats.region}\n`;
+      statsText += `📅 Member Since: ${userStats.join_date.toLocaleDateString()}\n\n`;
+
+      if (userStats.badges.length > 0) {
+        statsText += `🏆 Badges: ${userStats.badges.join(' ')}\n\n`;
+      }
+
+      if (achievements.length > 0) {
+        statsText += `🎖️ Recent Achievements:\n`;
+        achievements.slice(0, 3).forEach(achievement => {
+          statsText += `• ${achievement.achievement_name}\n`;
+        });
+        if (achievements.length > 3) {
+          statsText += `... and ${achievements.length - 3} more!\n`;
+        }
+      } else {
+        statsText += `🎖️ Complete more quests to earn achievements!`;
+      }
+
+      await this.displayScrollingText(
+        session,
+        "📊 Your Stats",
+        statsText
+      );
+    } catch (error) {
+      session.logger.error("Error showing user stats", { error });
+      session.layouts.showTextWall(
+        "Error loading statistics. Please try again.",
+        { durationMs: 3000 }
+      );
+    }
   }
 
   /**

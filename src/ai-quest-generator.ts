@@ -3,6 +3,8 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import axios from "axios";
 import { PlaceResult } from "./places-service";
+import { WeatherService, WeatherData as WeatherServiceData } from "./weather-service";
+import { BusinessHoursService } from "./business-hours-service";
 
 export interface WeatherData {
   condition: string;
@@ -54,44 +56,74 @@ const QuestGenerationSchema = z.object({
 
 export class AIQuestGenerator {
   private llm: ChatAnthropic;
-  private weatherApiKey: string;
+  private weatherService: WeatherService;
+  private businessHoursService: BusinessHoursService;
 
-  constructor(anthropicApiKey: string, weatherApiKey: string) {
+  constructor(anthropicApiKey: string, weatherApiKey?: string) {
     this.llm = new ChatAnthropic({
       model: "claude-sonnet-4-20250514", // todo this is megaoverkill
       apiKey: anthropicApiKey,
       temperature: 0.65, // Creative but not too random
       maxTokens: 1000,
     });
-    this.weatherApiKey = weatherApiKey;
+    this.weatherService = new WeatherService(weatherApiKey);
+    this.businessHoursService = new BusinessHoursService();
   }
 
   /**
    * Get current weather for location
    */
   async getWeather(lat: number, lng: number): Promise<WeatherData | null> {
-    if (
-      !this.weatherApiKey ||
-      this.weatherApiKey === "your_weather_api_key_here"
-    ) {
-      return null; // Skip weather if no API key
-    }
-
     try {
-      const response = await axios.get(
-        `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lng}&appid=${this.weatherApiKey}&units=metric`
-      );
-
-      const weather = response.data;
+      const weatherData = await this.weatherService.getWeatherForLocation(lat, lng);
       return {
-        condition: weather.weather[0].main, // Clear, Rain, Snow, etc.
-        temperature: Math.round(weather.main.temp),
-        description: weather.weather[0].description,
+        condition: weatherData.condition,
+        temperature: weatherData.temperature,
+        description: weatherData.description,
       };
     } catch (error) {
       console.warn("Failed to fetch weather:", error);
       return null;
     }
+  }
+
+  /**
+   * Get weather recommendations for equipment/items
+   */
+  getWeatherRecommendations(lat: number, lng: number): Promise<string[]> {
+    return this.weatherService.getWeatherForLocation(lat, lng)
+      .then(weather => this.weatherService.getWeatherBasedRecommendations(weather));
+  }
+
+  /**
+   * Check if a POI is currently accessible
+   */
+  checkPOIAccessibility(poi: PlaceResult, currentTime: Date = new Date()) {
+    return {
+      businessHours: this.businessHoursService.checkBusinessHours(poi, currentTime),
+      accessibility: this.businessHoursService.checkAccessibility(poi, currentTime)
+    };
+  }
+
+  /**
+   * Get accessibility status string for display
+   */
+  getAccessibilityStatus(poi: PlaceResult, currentTime: Date = new Date()): string {
+    const { businessHours, accessibility } = this.checkPOIAccessibility(poi, currentTime);
+    
+    if (!accessibility.isAccessible) {
+      return `❌ ${accessibility.reason}`;
+    }
+    
+    if (businessHours.isOpen24Hours) {
+      return "🕐 Open 24/7";
+    }
+    
+    if (businessHours.isOpen) {
+      return `✅ Open until ${businessHours.closesAt}`;
+    }
+    
+    return "✅ Accessible";
   }
 
   /**
@@ -127,11 +159,20 @@ export class AIQuestGenerator {
   }
 
   /**
-   * Curate and randomize POI list for AI selection
+   * Curate and randomize POI list for AI selection, filtering by accessibility
    */
-  private curatePOIList(pois: PlaceResult[]): PlaceResult[] {
-    // Take top 15 by rating, then randomize the rest
-    const sortedByRating = pois
+  private curatePOIList(pois: PlaceResult[], currentTime: Date = new Date()): PlaceResult[] {
+    // First filter POIs by accessibility and business hours
+    const accessiblePOIs = this.businessHoursService.filterAccessiblePOIs(pois, currentTime);
+    
+    if (accessiblePOIs.length === 0) {
+      // If no POIs are accessible, fall back to all POIs but prioritize 24/7 locations
+      console.warn("No accessible POIs found, falling back to all POIs");
+      return this.curatePOIListFallback(pois);
+    }
+
+    // Take top 15 accessible POIs by rating, then randomize
+    const sortedByRating = accessiblePOIs
       .sort((a, b) => (b.rating || 0) - (a.rating || 0))
       .slice(0, 15);
 
@@ -148,10 +189,27 @@ export class AIQuestGenerator {
   }
 
   /**
+   * Fallback POI curation when no accessible POIs are found
+   */
+  private curatePOIListFallback(pois: PlaceResult[]): PlaceResult[] {
+    // Prioritize 24/7 locations and outdoor spaces
+    const priorityTypes = ['gas_station', 'convenience_store', 'park', 'natural_feature'];
+    const priorityPOIs = pois.filter(poi => 
+      poi.types.some(type => priorityTypes.includes(type))
+    );
+
+    const poisToUse = priorityPOIs.length > 0 ? priorityPOIs : pois;
+    
+    return poisToUse
+      .sort((a, b) => (b.rating || 0) - (a.rating || 0))
+      .slice(0, 10);
+  }
+
+  /**
    * Generate AI-powered quest based on context
    */
   async generateQuest(context: QuestContext): Promise<AIGeneratedQuest> {
-    const curatedPOIs = this.curatePOIList(context.nearbyPOIs);
+    const curatedPOIs = this.curatePOIList(context.nearbyPOIs, context.currentTime);
     const timeWithFlavor = this.formatTimeWithFlavor(context.currentTime);
 
     // Build context string for the AI
@@ -167,13 +225,25 @@ export class AIQuestGenerator {
       )}\n`;
     }
 
-    contextStr += `\nAvailable POIs:\n`;
+    contextStr += `\nAvailable POIs (filtered for current accessibility):\n`;
     curatedPOIs.forEach((poi, index) => {
+      const businessHours = this.businessHoursService.checkBusinessHours(poi, context.currentTime);
+      const accessibility = this.businessHoursService.checkAccessibility(poi, context.currentTime);
+      
+      let statusInfo = "";
+      if (businessHours.isOpen24Hours) {
+        statusInfo = " [24/7]";
+      } else if (businessHours.isOpen) {
+        statusInfo = ` [Open until ${businessHours.closesAt}]`;
+      } else if (accessibility.isAccessible) {
+        statusInfo = " [Accessible]";
+      }
+      
       contextStr += `${index}. ${poi.name} - ${
         poi.formatted_address
       } (${poi.types.join(", ")})${
         poi.rating ? ` - Rating: ${poi.rating}/5` : ""
-      }\n`;
+      }${statusInfo}\n`;
     });
 
     const prompt = `You are a creative quest generator for a location-based adventure game. Given the current context and a list of nearby places, create an engaging quest that makes sense for the time, weather, and location.
@@ -184,13 +254,15 @@ Guidelines:
 - Choose ONE POI from the list by its index number (0-${curatedPOIs.length - 1})
 - You are not allowed to make up POIs even if you're sure they would be better. If none of the POIs fit, choose the last one in the list.
 - Create a quest that fits the current time, weather conditions, and POI type!!!
-- The quest should be doable by a normal human without breaking any laws or safety rules!!! So like, no breaking into museums after hours.
+- The quest should be doable by a normal human without breaking any laws or safety rules!!! 
+- ALL POIs in the list have been pre-filtered for current accessibility and business hours - they are all safe to visit right now
+- POIs marked [24/7] are always open, [Open until X] shows closing time, [Accessible] means it's an outdoor/public space
 - Generic quests like "Take a photo" or "Check in" are fine
 - Avoid categories the user has done recently unless needed
 - Make the quest specific and engaging with clear objectives
 - Points should reflect difficulty: 50-75 (easy), 76-125 (medium), 126-200 (hard)
-- Consider distance, time of day, and weather when assigning points
-- If no POIs really apply, the last POI in the list is a safe option at the user's current location. At night, it should be "stargazing" or similar, during the day "people watching" (if in a city) or "picnic", in rain "indoor relaxation" or "cafe visit", etc.
+- Consider distance, time of day, weather, and business hours when assigning points
+- If no POIs really apply, the last POI in the list is a safe option at the user's current location
 - Quest descriptions should be less than 30 words long. The glasses these are displayed on only have room for 3 lines at a time, so scrolling should generally be kept to a minimum.
 
 Generate a quest that would be fun and appropriate right now:`;
