@@ -6,6 +6,9 @@ export interface User {
   id: string;
   total_points: number;
   quests_completed: number;
+  daily_quest_count: number;
+  max_daily_quests: number;
+  last_quest_date: string | null;
   created_at: string;
   last_active: string;
 }
@@ -65,10 +68,21 @@ export class QuestDatabase {
             id TEXT PRIMARY KEY,
             total_points INTEGER DEFAULT 0,
             quests_completed INTEGER DEFAULT 0,
+            daily_quest_count INTEGER DEFAULT 0,
+            max_daily_quests INTEGER DEFAULT 0,
+            last_quest_date DATE,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             last_active DATETIME DEFAULT CURRENT_TIMESTAMP
           )
         `);
+
+        // Add new columns to existing users table if they don't exist
+        this.db.run(`ALTER TABLE users ADD COLUMN daily_quest_count INTEGER DEFAULT 0`, (err) => {
+          // Ignore error if column already exists
+        });
+        this.db.run(`ALTER TABLE users ADD COLUMN max_daily_quests INTEGER DEFAULT 0`, (err) => {
+          // Ignore error if column already exists
+        });
 
         // Quest templates table
         this.db.run(`
@@ -130,14 +144,17 @@ export class QuestDatabase {
         id: userId,
         total_points: 0,
         quests_completed: 0,
+        daily_quest_count: 0,
+        max_daily_quests: 0,
+        last_quest_date: null,
         created_at: new Date().toISOString(),
         last_active: new Date().toISOString()
       };
 
       this.db.run(
-        `INSERT OR IGNORE INTO users (id, total_points, quests_completed, created_at, last_active)
-         VALUES (?, ?, ?, ?, ?)`,
-        [user.id, user.total_points, user.quests_completed, user.created_at, user.last_active],
+        `INSERT OR IGNORE INTO users (id, total_points, quests_completed, daily_quest_count, max_daily_quests, last_quest_date, created_at, last_active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [user.id, user.total_points, user.quests_completed, user.daily_quest_count, user.max_daily_quests, user.last_quest_date, user.created_at, user.last_active],
         function(err) {
           if (err) reject(err);
           else resolve(user);
@@ -170,6 +187,88 @@ export class QuestDatabase {
         }
       );
     });
+  }
+
+  /**
+   * Update user's daily quest count when they complete a quest
+   */
+  async updateUserStreak(userId: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+      
+      this.db.serialize(() => {
+        // First, get current user data
+        this.db.get(
+          `SELECT daily_quest_count, max_daily_quests, last_quest_date FROM users WHERE id = ?`,
+          [userId],
+          (err, row: any) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+
+            if (!row) {
+              reject(new Error('User not found'));
+              return;
+            }
+
+            let newDailyCount = 1; // Start with 1 for today's quest
+            
+            // If last quest was today, increment the daily count
+            if (row.last_quest_date === today) {
+              newDailyCount = row.daily_quest_count + 1;
+            }
+            // If last quest was not today, reset to 1
+
+            const newMaxDailyQuests = Math.max(newDailyCount, row.max_daily_quests);
+
+            // Update user with new daily quest data
+            this.db.run(
+              `UPDATE users SET 
+               daily_quest_count = ?, 
+               max_daily_quests = ?, 
+               last_quest_date = ?,
+               last_active = CURRENT_TIMESTAMP
+               WHERE id = ?`,
+              [newDailyCount, newMaxDailyQuests, today, userId],
+              (updateErr) => {
+                if (updateErr) reject(updateErr);
+                else resolve();
+              }
+            );
+          }
+        );
+      });
+    });
+  }
+
+  /**
+   * Reset daily quest counts for users who haven't completed a quest today
+   */
+  async resetExpiredStreaks(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const today = new Date().toISOString().split('T')[0];
+      
+      this.db.run(
+        `UPDATE users SET daily_quest_count = 0 
+         WHERE last_quest_date IS NOT NULL 
+         AND last_quest_date < ?`,
+        [today],
+        (err) => {
+          if (err) reject(err);
+          else resolve();
+        }
+      );
+    });
+  }
+
+  /**
+   * Get yesterday's date in YYYY-MM-DD format
+   */
+  private getYesterday(): string {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    return yesterday.toISOString().split('T')[0];
   }
 
   // Quest template operations
@@ -277,17 +376,46 @@ export class QuestDatabase {
           [completed_at, pointsEarned, questId]
         );
 
-        // Update user points and quest count
-        this.db.run(
-          `UPDATE users SET
-           total_points = total_points + ?,
-           quests_completed = quests_completed + 1,
-           last_active = CURRENT_TIMESTAMP
-           WHERE id = (SELECT user_id FROM active_quests WHERE id = ?)`,
-          [pointsEarned, questId],
-          (err) => {
-            if (err) reject(err);
-            else resolve();
+        // Get user ID for streak update
+        this.db.get(
+          `SELECT user_id FROM active_quests WHERE id = ?`,
+          [questId],
+          (err, row: any) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+
+            if (!row) {
+              reject(new Error('Quest not found'));
+              return;
+            }
+
+            const userId = row.user_id;
+
+            // Update user points and quest count
+            this.db.run(
+              `UPDATE users SET
+               total_points = total_points + ?,
+               quests_completed = quests_completed + 1,
+               last_active = CURRENT_TIMESTAMP
+               WHERE id = ?`,
+              [pointsEarned, userId],
+              (updateErr) => {
+                if (updateErr) {
+                  reject(updateErr);
+                  return;
+                }
+
+                // Update streak after successful quest completion
+                this.updateUserStreak(userId)
+                  .then(() => resolve())
+                  .catch((streakErr) => {
+                    console.warn('Failed to update streak:', streakErr);
+                    resolve(); // Don't fail the quest completion if streak update fails
+                  });
+              }
+            );
           }
         );
       });
