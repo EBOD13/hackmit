@@ -56,6 +56,12 @@ class ExampleMentraOSApp extends AppServer {
     { lat: number; lng: number; timestamp: Date }
   >();
 
+  /** Map to store last distance notification time to prevent spam */
+  private lastDistanceNotificationMap = new Map<string, number>();
+
+  /** Map to store periodic distance update intervals */
+  private distanceUpdateIntervals = new Map<string, NodeJS.Timeout>();
+
   /**
    * Get a random quest template from database
    */
@@ -174,8 +180,17 @@ class ExampleMentraOSApp extends AppServer {
     title: string,
     content: string,
     maxLinesPerScreen: number = 3,
-    scrollDelay: number = 2000
+    scrollDelay: number = 1000
   ): Promise<void> {
+    const userId = Array.from(this.userSessionsMap.entries())
+      .find(([_, sess]) => sess === session)?.[0];
+    
+    // Schedule distance card to show after 10 seconds
+    if (userId) {
+      setTimeout(() => {
+        this.showDistanceCardForUser(userId, session);
+      }, 10000);
+    }
     const lines = this.wrapText(content);
     console.log("Wrapped lines:", lines.join("\n"));
 
@@ -341,7 +356,7 @@ class ExampleMentraOSApp extends AppServer {
             latitude: locationData.lat,
             longitude: locationData.lng,
             accuracy: locationData.accuracy,
-            timestamp: new Date(locationData.timestamp).toLocaleString(),
+            timestamp: locationData.timestamp ? new Date(locationData.timestamp).toLocaleString() : 'Unknown',
           });
 
           // Store user's current location
@@ -365,6 +380,16 @@ class ExampleMentraOSApp extends AppServer {
     } catch (error) {
       session.logger.warn("Failed to start location tracking", { error });
     }
+
+    // Set up periodic distance updates every 30 seconds
+    const distanceInterval = setInterval(() => {
+      this.showDistanceCardForUser(userId, session).catch((error) => {
+        session.logger.warn("Error in periodic distance update", { error });
+      });
+    }, 30000);
+    
+    this.distanceUpdateIntervals.set(userId, distanceInterval);
+    session.logger.info("Location tracking and periodic distance updates started");
 
     /**
      * Handles quest-related voice commands
@@ -483,6 +508,12 @@ class ExampleMentraOSApp extends AppServer {
           );
         }
       } else if (
+        normalizedText.includes("show distance") ||
+        normalizedText.includes("how far")
+      ) {
+        // Show current distance to quest
+        await this.showDistanceCardForUser(userId, session);
+      } else if (
         normalizedText.includes("complete quest") ||
         normalizedText.includes("finish quest") ||
         normalizedText.includes("done quest")
@@ -579,10 +610,62 @@ class ExampleMentraOSApp extends AppServer {
     this.addCleanupHandler(() => {
       this.userSessionsMap.delete(userId);
       this.userLocationsMap.delete(userId);
+      
+      // Clear periodic distance updates
+      const distanceInterval = this.distanceUpdateIntervals.get(userId);
+      if (distanceInterval) {
+        clearInterval(distanceInterval);
+        this.distanceUpdateIntervals.delete(userId);
+      }
+      
       if (stopLocationUpdates) {
         stopLocationUpdates();
       }
     });
+  }
+
+  /**
+   * Show distance card for a specific user
+   */
+  private async showDistanceCardForUser(userId: string, session: AppSession): Promise<void> {
+    try {
+      const activeQuest = await this.database.getUserActiveQuest(userId);
+      if (activeQuest) {
+        const questTemplate = await this.database.getQuestTemplateById(
+          activeQuest.quest_template_id
+        );
+        const userLocation = this.userLocationsMap.get(userId);
+        
+        if (questTemplate && questTemplate.location_lat && questTemplate.location_lng && userLocation) {
+          const distance = this.calculateDistance(
+            userLocation.lat,
+            userLocation.lng,
+            questTemplate.location_lat,
+            questTemplate.location_lng
+          );
+          
+          const distanceInMeters = Math.round(distance * 1000);
+          
+          if (distance <= 0.1) {
+            session.layouts.showTextWall(
+              `🎯 Quest Location Nearby!\nYou're ${distanceInMeters}m away from your quest destination!`,
+              { durationMs: 3000 }
+            );
+          } else {
+            const distanceText = distance < 1 
+              ? `${distanceInMeters}m` 
+              : `${distance.toFixed(1)}km`;
+            
+            session.layouts.showTextWall(
+              `📍 Quest Distance: ${distanceText}\nto your quest destination`,
+              { durationMs: 3000 }
+            );
+          }
+        }
+      }
+    } catch (error) {
+      session.logger.warn("Error showing distance card", { error });
+    }
   }
 
   /**
@@ -596,8 +679,10 @@ class ExampleMentraOSApp extends AppServer {
     try {
       const activeQuest = await this.database.getUserActiveQuest(userId);
       if (activeQuest) {
-        // Get the quest template to check location
-        const questTemplate = await this.getRandomQuestTemplate(); // TODO: Get specific template
+        // Get the specific quest template for the user's active quest
+        const questTemplate = await this.database.getQuestTemplateById(
+          activeQuest.quest_template_id
+        );
         if (
           questTemplate &&
           questTemplate.location_lat &&
@@ -610,13 +695,40 @@ class ExampleMentraOSApp extends AppServer {
             questTemplate.location_lng
           );
 
-          // If within 100 meters of quest location, notify user
-          if (distance <= 0.1) {
-            // 0.1 km = 100 meters
-            session.layouts.showDashboardCard(
-              "🎯 Quest Location Nearby!",
-              "You're close to your quest destination!"
-            );
+          // Show distance to quest location with throttling
+          const distanceInMeters = Math.round(distance * 1000);
+          const now = Date.now();
+          const lastNotification = this.lastDistanceNotificationMap.get(userId) || 0;
+          
+          // Show distance notification every 6 seconds, using TextWall for better visibility
+          if (now - lastNotification > 6000) {
+            this.lastDistanceNotificationMap.set(userId, now);
+            
+            // If within 100 meters of quest location, notify user they're close
+            if (distance <= 0.1) {
+              // 0.1 km = 100 meters
+              session.layouts.showTextWall(
+                `🎯 Quest Location Nearby!\nYou're ${distanceInMeters}m away from your quest destination!`,
+                { durationMs: 2000 }
+              );
+            } else {
+              // Show distance for locations further away
+              const distanceText = distance < 1 
+                ? `${distanceInMeters}m` 
+                : `${distance.toFixed(1)}km`;
+              
+              session.layouts.showTextWall(
+                `📍 Quest Distance: ${distanceText}\nto your quest destination`,
+                { durationMs: 2000 }
+              );
+            }
+            
+            // Also log the distance for debugging
+            session.logger.info("Distance to quest", {
+              distanceKm: distance,
+              distanceMeters: distanceInMeters,
+              questTitle: questTemplate.title
+            });
           }
         }
       }
