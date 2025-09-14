@@ -242,4 +242,123 @@ export function setupExpressRoutes(server: AppServer): void {
       }
     }
   );
+
+  // API endpoint for rerolling a quest
+  app.post(
+    "/api/quest/reroll",
+    // @ts-ignore
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const userId = req.authUserId;
+        if (!userId) {
+          return res.json({ success: false, message: "Not authenticated" });
+        }
+
+        const database = (server as any).database;
+        const placesService = (server as any).placesService;
+        const userLocationsMap = (server as any).userLocationsMap;
+        const aiQuestGenerator = (server as any).aiQuestGenerator;
+
+        // Check if user has an active quest to reroll
+        const existingQuest = await database.getUserActiveQuest(userId);
+        if (!existingQuest) {
+          return res.json({
+            success: false,
+            message: "You don't have an active quest to reroll!",
+          });
+        }
+
+        // Mark current quest as abandoned
+        await database.abandonQuest(existingQuest.id);
+
+        // Try to generate a new AI-powered quest
+        const userLocation = userLocationsMap?.get(userId);
+        let questTemplate = null;
+
+        if (userLocation && placesService && aiQuestGenerator) {
+          try {
+            // Get nearby POIs from multiple categories for AI
+            const questTypes = ['food', 'exercise', 'culture', 'exploration'] as const;
+            let allNearbyPOIs: any[] = [];
+
+            for (const questType of questTypes) {
+              try {
+                const pois = await placesService.findNearbyPlaces(userLocation.lat, userLocation.lng, questType, 2000);
+                allNearbyPOIs = [...allNearbyPOIs, ...pois];
+              } catch (error) {
+                console.warn(`Failed to fetch ${questType} POIs for reroll`, error);
+              }
+            }
+
+            if (allNearbyPOIs.length > 0) {
+              // Add fallback option
+              allNearbyPOIs.push({
+                name: "Somewhere nearby",
+                formatted_address: "Your current location",
+                geometry: { location: { lat: userLocation.lat, lng: userLocation.lng } },
+                types: ["general"],
+                rating: null,
+                user_ratings_total: null,
+              });
+
+              // Build context for AI
+              const questContext = {
+                currentTime: new Date(),
+                weather: await aiQuestGenerator.getWeather(userLocation.lat, userLocation.lng),
+                nearbyPOIs: allNearbyPOIs,
+                recentQuestCategories: await database.getRecentQuestCategories(userId, 3),
+                userLocation: { lat: userLocation.lat, lng: userLocation.lng }
+              };
+
+              // Generate quest using AI
+              const aiQuest = await aiQuestGenerator.generateQuest(questContext);
+              const selectedPOI = allNearbyPOIs[aiQuest.selectedPOIIndex];
+
+              if (selectedPOI) {
+                questTemplate = await database.createQuestTemplate({
+                  title: aiQuest.title,
+                  description: aiQuest.description,
+                  category: 'ai-generated',
+                  points: aiQuest.points,
+                  location_name: selectedPOI.name,
+                  location_address: selectedPOI.formatted_address,
+                  location_lat: selectedPOI.geometry.location.lat,
+                  location_lng: selectedPOI.geometry.location.lng,
+                });
+              }
+            }
+          } catch (error) {
+            console.warn('AI quest generation failed for reroll, falling back:', error);
+          }
+        }
+
+        // Fallback to database quest if no location-aware quest available
+        if (!questTemplate) {
+          questTemplate = await database.getRandomQuestTemplate();
+        }
+
+        if (questTemplate) {
+          const activeQuest = await database.createActiveQuest(
+            userId,
+            questTemplate.id
+          );
+          if (activeQuest) {
+            res.json({
+              success: true,
+              message: "Quest rerolled! Here's your new adventure.",
+              quest: activeQuest,
+              template: questTemplate
+            });
+          } else {
+            res.json({ success: false, message: "Failed to create new quest" });
+          }
+        } else {
+          res.json({ success: false, message: "No quests available" });
+        }
+      } catch (error) {
+        console.error("Error rerolling quest via API:", error);
+        res.json({ success: false, message: "Server error" });
+      }
+    }
+  );
 }

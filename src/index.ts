@@ -81,6 +81,9 @@ class ExampleMentraOSApp extends AppServer {
   /** Map to store periodic distance update intervals */
   private distanceUpdateIntervals = new Map<string, NodeJS.Timeout>();
 
+  /** Map to track when scrolling text is active for each user */
+  private scrollingTextActive = new Map<string, boolean>();
+
   /**
    * Get a random quest template from database
    */
@@ -151,6 +154,15 @@ class ExampleMentraOSApp extends AppServer {
         recentCategories: questContext.recentQuestCategories,
       });
 
+      allNearbyPOIs.push({
+        name: "Somewhere nearby",
+        formatted_address: "Your current location",
+        geometry: { location: { lat, lng } },
+        types: ["general"],
+        rating: null,
+        user_ratings_total: null,
+      });
+
       // Generate quest using AI
       const aiQuest: AIGeneratedQuest =
         await this.aiQuestGenerator.generateQuest(questContext);
@@ -191,7 +203,7 @@ class ExampleMentraOSApp extends AppServer {
     } catch (error) {
       session.logger.error("Error generating AI-powered quest", { error });
       // Fallback to the old method
-      return await this.generateFallbackQuest(lat, lng, session);
+      return await this.generateFallbackQuest(lat, lng, userId, session);
     }
   }
 
@@ -297,18 +309,12 @@ class ExampleMentraOSApp extends AppServer {
     title: string,
     content: string,
     maxLinesPerScreen: number = 3,
-    scrollDelay: number = 1000
+    scrollDelay: number = 1750
   ): Promise<void> {
     const userId = Array.from(this.userSessionsMap.entries()).find(
       ([_, sess]) => sess === session
     )?.[0];
 
-    // Schedule distance card to show after 10 seconds
-    if (userId) {
-      setTimeout(() => {
-        this.showDistanceCardForUser(userId, session);
-      }, 10000);
-    }
     const lines = this.wrapText(content);
 
     // If content fits in one screen, show normally
@@ -317,11 +323,19 @@ class ExampleMentraOSApp extends AppServer {
       return;
     }
 
+    // Mark scrolling as active for this user
+    if (userId) {
+      this.scrollingTextActive.set(userId, true);
+    }
+
     session.logger.info("Displaying scrolling text", {
       totalLines: lines.length,
       maxLinesPerScreen,
       scrollDelay,
     });
+
+    // Calculate total scrolling duration
+    const totalScrollPositions = lines.length - maxLinesPerScreen + 1;
 
     // Show initial screen first (lines 0-4)
     let currentWindow = lines.slice(0, maxLinesPerScreen);
@@ -333,8 +347,6 @@ class ExampleMentraOSApp extends AppServer {
     await new Promise((resolve) => setTimeout(resolve, scrollDelay));
 
     // Scroll through the content one line at a time
-    const totalScrollPositions = lines.length - maxLinesPerScreen + 1;
-
     for (let position = 1; position < totalScrollPositions; position++) {
       const windowLines = lines.slice(position, position + maxLinesPerScreen);
       const windowContent = windowLines.join("\n");
@@ -354,6 +366,11 @@ class ExampleMentraOSApp extends AppServer {
         await new Promise((resolve) => setTimeout(resolve, scrollDelay));
       }
     }
+
+    // Mark scrolling as completed for this user
+    if (userId) {
+      this.scrollingTextActive.set(userId, false);
+    }
   }
 
   /**
@@ -362,6 +379,7 @@ class ExampleMentraOSApp extends AppServer {
   private async displayQuestTemplate(
     session: AppSession,
     questTemplate: QuestTemplate,
+    userId: string,
     userLocation?: { lat: number; lng: number }
   ): Promise<void> {
     // Build quest content
@@ -388,6 +406,11 @@ class ExampleMentraOSApp extends AppServer {
       `🎯 ${questTemplate.title}`,
       questContent
     );
+
+    setTimeout(() => {
+      this.showDistanceCardForUser(userId, session);
+    }, 5000);
+    // Schedule distance card to show after single screen display
 
     session.logger.info("Quest displayed", {
       questId: questTemplate.id,
@@ -452,9 +475,10 @@ class ExampleMentraOSApp extends AppServer {
       });
 
       // Show welcome message with user stats
-      session.layouts.showTextWall(
-        `🎮 POI Quest App loaded!\n\n👤 Total Points: ${user.total_points}\n🏆 Quests Completed: ${user.quests_completed}\n\nSay 'new quest' to begin your adventure!`,
-        { durationMs: 5000 }
+      this.displayScrollingText(
+        session,
+        `🎮 POI Quest App loaded!`,
+        `👤 Total Points: ${user.total_points}\n🏆 Quests Completed: ${user.quests_completed}\n\nSay 'new quest' to begin your adventure!\n\nCommands: 'current quest', 'complete quest', 'reroll quest'`
       );
     } catch (error) {
       session.logger.error("Failed to initialize user", { error });
@@ -567,6 +591,7 @@ class ExampleMentraOSApp extends AppServer {
               await this.displayQuestTemplate(
                 session,
                 questTemplate,
+                userId,
                 userLocation || undefined
               );
 
@@ -612,6 +637,7 @@ class ExampleMentraOSApp extends AppServer {
               await this.displayQuestTemplate(
                 session,
                 questTemplate,
+                userId,
                 userLocation
               );
             } else {
@@ -650,7 +676,8 @@ class ExampleMentraOSApp extends AppServer {
             // Get updated user stats
             const user = await this.database.getUser(userId);
 
-            session.layouts.showReferenceCard(
+            this.displayScrollingText(
+              session,
               "🎉 Quest Completed!",
               `Congratulations! You earned ${points} points for completing "${
                 questTemplate?.title || "your quest"
@@ -658,8 +685,7 @@ class ExampleMentraOSApp extends AppServer {
                 user?.total_points || 0
               }\n🏆 Quests Completed: ${
                 user?.quests_completed || 0
-              }\n\nSay 'new quest' for your next adventure.`,
-              { durationMs: 5000 }
+              }\n\nSay 'new quest' for your next adventure.`
             );
 
             session.logger.info("Quest completed", {
@@ -678,6 +704,89 @@ class ExampleMentraOSApp extends AppServer {
           session.logger.error("Error completing quest", { error });
           session.layouts.showTextWall(
             "Error completing quest. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
+        normalizedText.includes("reroll quest") ||
+        normalizedText.includes("re-roll quest") ||
+        normalizedText.includes("new quest please") ||
+        normalizedText.includes("different quest") ||
+        normalizedText.includes("skip quest")
+      ) {
+        try {
+          // Check if user has an active quest to reroll
+          const existingQuest = await this.database.getUserActiveQuest(userId);
+          if (!existingQuest) {
+            session.layouts.showTextWall(
+              "You don't have an active quest to reroll. Say 'new quest' to get one!",
+              { durationMs: 3000 }
+            );
+            return;
+          }
+
+          // Mark current quest as abandoned
+          await this.database.abandonQuest(existingQuest.id);
+
+          session.layouts.showTextWall(
+            "🔄 Quest abandoned. Getting you a new adventure...",
+            { durationMs: 3000 }
+          );
+
+          // Generate a new quest
+          const userLocation = this.userLocationsMap.get(userId);
+          let questTemplate: QuestTemplate | null = null;
+
+          if (userLocation) {
+            session.layouts.showTextWall(
+              "🔍 AI is analyzing your surroundings for a different adventure...",
+              { durationMs: 10000 }
+            );
+            questTemplate = await this.generateAIQuest(
+              userLocation.lat,
+              userLocation.lng,
+              userId,
+              session
+            );
+          } else {
+            session.logger.info(
+              "No location available, using random quest for reroll"
+            );
+            questTemplate = await this.getRandomQuestTemplate();
+          }
+
+          if (questTemplate) {
+            const activeQuest = await this.database.createActiveQuest(
+              userId,
+              questTemplate.id
+            );
+            if (activeQuest) {
+              await this.displayQuestTemplate(
+                session,
+                questTemplate,
+                userId,
+                userLocation
+              );
+              session.layouts.showTextWall(
+                "🎯 Here's your new quest! Say 'complete quest' when done.",
+                { durationMs: 4000 }
+              );
+            } else {
+              session.layouts.showTextWall(
+                "Failed to create new quest. Please try again.",
+                { durationMs: 3000 }
+              );
+            }
+          } else {
+            session.layouts.showTextWall(
+              "No new quests available right now. Please try again later.",
+              { durationMs: 3000 }
+            );
+          }
+        } catch (error) {
+          session.logger.error("Error rerolling quest", { error });
+          session.layouts.showTextWall(
+            "Error getting new quest. Please try again.",
             { durationMs: 3000 }
           );
         }
@@ -736,6 +845,9 @@ class ExampleMentraOSApp extends AppServer {
         this.distanceUpdateIntervals.delete(userId);
       }
 
+      // Clear scrolling text state
+      this.scrollingTextActive.delete(userId);
+
       if (stopLocationUpdates) {
         stopLocationUpdates();
       }
@@ -750,6 +862,13 @@ class ExampleMentraOSApp extends AppServer {
     session: AppSession
   ): Promise<void> {
     try {
+      // Don't show distance card if scrolling text is currently active
+      if (this.scrollingTextActive.get(userId)) {
+        session.logger.debug(
+          "Skipping distance card display - scrolling text is active"
+        );
+        return;
+      }
       const activeQuest = await this.database.getUserActiveQuest(userId);
       if (activeQuest) {
         const questTemplate = await this.database.getQuestTemplateById(

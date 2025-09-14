@@ -294,6 +294,21 @@ export class QuestDatabase {
     });
   }
 
+  async abandonQuest(questId: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const abandoned_at = new Date().toISOString();
+
+      this.db.run(
+        `UPDATE active_quests SET status = 'abandoned', completed_at = ? WHERE id = ?`,
+        [abandoned_at, questId],
+        (err) => {
+          if (err) reject(err);
+          else resolve();
+        }
+      );
+    });
+  }
+
   // POI cache operations
   async cachePOI(poi: Omit<POICache, 'id' | 'last_updated'>): Promise<POICache> {
     return new Promise((resolve, reject) => {
