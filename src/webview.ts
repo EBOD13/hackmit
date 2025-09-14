@@ -91,33 +91,55 @@ export function setupExpressRoutes(server: AppServer): void {
           });
         }
 
-        // Try to generate a location-aware quest
+        // Try to generate an AI-powered quest
         const userLocation = userLocationsMap?.get(userId);
+        const aiQuestGenerator = (server as any).aiQuestGenerator;
         let questTemplate = null;
 
-        if (userLocation && placesService) {
-          const questLocations = await placesService.findQuestLocations(
-            userLocation.lat,
-            userLocation.lng
-          );
-          if (questLocations.length > 0) {
-            const randomLocation =
-              questLocations[Math.floor(Math.random() * questLocations.length)];
-            const questData = placesService.generateQuestDescription(
-              randomLocation.place,
-              randomLocation.questType
-            );
+        if (userLocation && placesService && aiQuestGenerator) {
+          try {
+            // Get nearby POIs from multiple categories for AI
+            const questTypes = ['food', 'exercise', 'culture', 'exploration'] as const;
+            let allNearbyPOIs: any[] = [];
 
-            questTemplate = await database.createQuestTemplate({
-              title: questData.title,
-              description: questData.description,
-              category: randomLocation.category,
-              points: questData.points,
-              location_name: randomLocation.place.name,
-              location_address: randomLocation.place.formatted_address,
-              location_lat: randomLocation.place.geometry.location.lat,
-              location_lng: randomLocation.place.geometry.location.lng,
-            });
+            for (const questType of questTypes) {
+              try {
+                const pois = await placesService.findNearbyPlaces(userLocation.lat, userLocation.lng, questType, 2000);
+                allNearbyPOIs = [...allNearbyPOIs, ...pois];
+              } catch (error) {
+                console.warn(`Failed to fetch ${questType} POIs for webview`, error);
+              }
+            }
+
+            if (allNearbyPOIs.length > 0) {
+              // Build context for AI
+              const questContext = {
+                currentTime: new Date(),
+                weather: await aiQuestGenerator.getWeather(userLocation.lat, userLocation.lng),
+                nearbyPOIs: allNearbyPOIs,
+                recentQuestCategories: await database.getRecentQuestCategories(userId, 3),
+                userLocation: { lat: userLocation.lat, lng: userLocation.lng }
+              };
+
+              // Generate quest using AI
+              const aiQuest = await aiQuestGenerator.generateQuest(questContext);
+              const selectedPOI = allNearbyPOIs[aiQuest.selectedPOIIndex];
+
+              if (selectedPOI) {
+                questTemplate = await database.createQuestTemplate({
+                  title: aiQuest.title,
+                  description: aiQuest.description,
+                  category: 'ai-generated',
+                  points: aiQuest.points,
+                  location_name: selectedPOI.name,
+                  location_address: selectedPOI.formatted_address,
+                  location_lat: selectedPOI.geometry.location.lat,
+                  location_lng: selectedPOI.geometry.location.lng,
+                });
+              }
+            }
+          } catch (error) {
+            console.warn('AI quest generation failed in webview, falling back:', error);
           }
         }
 

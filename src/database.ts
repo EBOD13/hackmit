@@ -330,6 +330,24 @@ export class QuestDatabase {
     });
   }
 
+  async getRecentQuestCategories(userId: string, limit: number = 3): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+      this.db.all(
+        `SELECT DISTINCT qt.category
+         FROM active_quests aq
+         JOIN quest_templates qt ON aq.quest_template_id = qt.id
+         WHERE aq.user_id = ? AND aq.status = 'completed'
+         ORDER BY aq.completed_at DESC
+         LIMIT ?`,
+        [userId, limit],
+        (err, rows: { category: string }[]) => {
+          if (err) reject(err);
+          else resolve(rows.map(row => row.category));
+        }
+      );
+    });
+  }
+
   async close(): Promise<void> {
     return new Promise((resolve) => {
       this.db.close(() => resolve());
