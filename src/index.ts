@@ -1,4 +1,4 @@
-import { ToolCall, AppServer, AppSession } from "@mentra/sdk";
+﻿import { ToolCall, AppServer, AppSession } from "@mentra/sdk";
 import path from "path";
 import { setupExpressRoutes } from "./webview";
 import { handleToolCall } from "./tools";
@@ -542,6 +542,11 @@ class ExampleMentraOSApp extends AppServer {
      */
     const handleQuestCommands = async (text: string): Promise<void> => {
       const normalizedText = text.toLowerCase().trim();
+
+      if (this.scrollingTextActive.get(userId)) {
+        session.logger.debug("Not processing text - scrolling text is active");
+        return;
+      }
 
       if (
         normalizedText.includes("new quest") ||
