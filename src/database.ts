@@ -6,6 +6,8 @@ export interface User {
   id: string;
   total_points: number;
   quests_completed: number;
+  current_streak: number;
+  last_quest_date: string;
   created_at: string;
   last_active: string;
 }
@@ -65,10 +67,16 @@ export class QuestDatabase {
             id TEXT PRIMARY KEY,
             total_points INTEGER DEFAULT 0,
             quests_completed INTEGER DEFAULT 0,
+            current_streak INTEGER DEFAULT 0,
+            last_quest_date TEXT DEFAULT '',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             last_active DATETIME DEFAULT CURRENT_TIMESTAMP
           )
         `);
+
+        // Add new columns to existing users table if they don't exist
+        this.db.run(`ALTER TABLE users ADD COLUMN current_streak INTEGER DEFAULT 0`, () => {});
+        this.db.run(`ALTER TABLE users ADD COLUMN last_quest_date TEXT DEFAULT ''`, () => {});
 
         // Quest templates table
         this.db.run(`
@@ -130,14 +138,16 @@ export class QuestDatabase {
         id: userId,
         total_points: 0,
         quests_completed: 0,
+        current_streak: 0,
+        last_quest_date: '',
         created_at: new Date().toISOString(),
         last_active: new Date().toISOString()
       };
 
       this.db.run(
-        `INSERT OR IGNORE INTO users (id, total_points, quests_completed, created_at, last_active)
-         VALUES (?, ?, ?, ?, ?)`,
-        [user.id, user.total_points, user.quests_completed, user.created_at, user.last_active],
+        `INSERT OR IGNORE INTO users (id, total_points, quests_completed, current_streak, last_quest_date, created_at, last_active)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [user.id, user.total_points, user.quests_completed, user.current_streak, user.last_quest_date, user.created_at, user.last_active],
         function(err) {
           if (err) reject(err);
           else resolve(user);
@@ -277,11 +287,19 @@ export class QuestDatabase {
           [completed_at, pointsEarned, questId]
         );
 
-        // Update user points and quest count
+        // Update user points, quest count, and streak
         this.db.run(
           `UPDATE users SET
            total_points = total_points + ?,
            quests_completed = quests_completed + 1,
+           current_streak = CASE 
+             WHEN date(last_quest_date) = date('now', '-1 day') OR last_quest_date = '' 
+             THEN current_streak + 1 
+             WHEN date(last_quest_date) = date('now') 
+             THEN current_streak 
+             ELSE 1 
+           END,
+           last_quest_date = date('now'),
            last_active = CURRENT_TIMESTAMP
            WHERE id = (SELECT user_id FROM active_quests WHERE id = ?)`,
           [pointsEarned, questId],

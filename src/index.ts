@@ -1,4 +1,4 @@
-﻿import { ToolCall, AppServer, AppSession } from "@mentra/sdk";
+import { ToolCall, AppServer, AppSession } from "@mentra/sdk";
 import path from "path";
 import { setupExpressRoutes } from "./webview";
 import { handleToolCall } from "./tools";
@@ -78,8 +78,6 @@ class ExampleMentraOSApp extends AppServer {
   /** Map to store last distance notification time to prevent spam */
   private lastDistanceNotificationMap = new Map<string, number>();
 
-  /** Map to store periodic distance update intervals */
-  private distanceUpdateIntervals = new Map<string, NodeJS.Timeout>();
 
   /** Map to track when scrolling text is active for each user */
   private scrollingTextActive = new Map<string, boolean>();
@@ -405,7 +403,7 @@ class ExampleMentraOSApp extends AppServer {
     title: string,
     content: string,
     maxLinesPerScreen: number = 3,
-    scrollDelay: number = 1750
+    scrollDelay: number = 1250
   ): Promise<void> {
     const userId = Array.from(this.userSessionsMap.entries()).find(
       ([_, sess]) => sess === session
@@ -503,10 +501,6 @@ class ExampleMentraOSApp extends AppServer {
       questContent
     );
 
-    setTimeout(() => {
-      this.showDistanceCardForUser(userId, session);
-    }, 5000);
-    // Schedule distance card to show after single screen display
 
     session.logger.info("Quest displayed", {
       questId: questTemplate.id,
@@ -620,17 +614,7 @@ class ExampleMentraOSApp extends AppServer {
       session.logger.warn("Failed to start location tracking", { error });
     }
 
-    // Set up periodic distance updates every 30 seconds
-    const distanceInterval = setInterval(() => {
-      this.showDistanceCardForUser(userId, session).catch((error) => {
-        session.logger.warn("Error in periodic distance update", { error });
-      });
-    }, 30000);
-
-    this.distanceUpdateIntervals.set(userId, distanceInterval);
-    session.logger.info(
-      "Location tracking and periodic distance updates started"
-    );
+    session.logger.info("Location tracking started");
 
     /**
      * Handles quest-related voice commands
@@ -783,8 +767,21 @@ class ExampleMentraOSApp extends AppServer {
             // Get updated user stats
             const user = await this.database.getUser(userId);
 
-            // Play celebration audio
-            await this.playTTSWithDebounce(
+            // Show completion text immediately
+            this.displayScrollingText(
+              session,
+              "🎉 Quest Completed!",
+              `Congratulations! You earned ${points} points for completing "${
+                questTemplate?.title || "your quest"
+              }"!\n\n📊 Total Points: ${
+                user?.total_points || 0
+              }\n🏆 Quests Completed: ${
+                user?.quests_completed || 0
+              }\n\nSay 'new quest' for your next adventure.`
+            );
+
+            // Play celebration audio (non-blocking)
+            this.playTTSWithDebounce(
               session,
               `Quest completed! You earned ${points} points. Your total is now ${user?.total_points || 0} points.`,
               {
@@ -796,18 +793,6 @@ class ExampleMentraOSApp extends AppServer {
                 }
               },
               true // Force play for quest completion
-            );
-
-            this.displayScrollingText(
-              session,
-              "🎉 Quest Completed!",
-              `Congratulations! You earned ${points} points for completing "${
-                questTemplate?.title || "your quest"
-              }"!\n\n📊 Total Points: ${
-                user?.total_points || 0
-              }\n🏆 Quests Completed: ${
-                user?.quests_completed || 0
-              }\n\nSay 'new quest' for your next adventure.`
             );
 
             session.logger.info("Quest completed", {
@@ -844,6 +829,40 @@ class ExampleMentraOSApp extends AppServer {
           session.logger.error("Error showing leaderboard", { error });
           session.layouts.showTextWall(
             "Error loading leaderboard. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
+        normalizedText.includes("show progress") ||
+        normalizedText.includes("my progress") ||
+        normalizedText.includes("streak")
+      ) {
+        try {
+          await this.playTTSWithDebounce(session, "Checking your progress...", {
+            voice_settings: { stability: 0.6, speed: 1.1 }
+          });
+          await this.showProgress(session, userId);
+        } catch (error) {
+          session.logger.error("Error showing progress", { error });
+          session.layouts.showTextWall(
+            "Error loading progress. Please try again.",
+            { durationMs: 3000 }
+          );
+        }
+      } else if (
+        normalizedText.includes("show distance") ||
+        normalizedText.includes("how far") ||
+        normalizedText.includes("distance")
+      ) {
+        try {
+          await this.playTTSWithDebounce(session, "Calculating your location...", {
+            voice_settings: { stability: 0.6, speed: 1.1 }
+          });
+          await this.showDistanceCardForUser(userId, session);
+        } catch (error) {
+          session.logger.error("Error showing distance", { error });
+          session.layouts.showTextWall(
+            "Error calculating distance. Please try again.",
             { durationMs: 3000 }
           );
         }
@@ -982,12 +1001,6 @@ class ExampleMentraOSApp extends AppServer {
       this.userSessionsMap.delete(userId);
       this.userLocationsMap.delete(userId);
 
-      // Clear periodic distance updates
-      const distanceInterval = this.distanceUpdateIntervals.get(userId);
-      if (distanceInterval) {
-        clearInterval(distanceInterval);
-        this.distanceUpdateIntervals.delete(userId);
-      }
 
       // Clear scrolling text state
       this.scrollingTextActive.delete(userId);
@@ -1000,6 +1013,80 @@ class ExampleMentraOSApp extends AppServer {
         stopLocationUpdates();
       }
     });
+  }
+
+  /**
+   * Show user progress including streak information
+   */
+  private async showProgress(session: AppSession, userId: string): Promise<void> {
+    try {
+      const user = await this.database.getUser(userId);
+      
+      if (!user) {
+        session.layouts.showTextWall(
+          "📊 Progress\n\nUser not found. Please try again.",
+          { durationMs: 4000 }
+        );
+        return;
+      }
+
+      // Calculate streak status
+      const today = new Date().toISOString().split('T')[0];
+      const lastQuestDate = user.last_quest_date;
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = yesterday.toISOString().split('T')[0];
+
+      let streakStatus = "";
+      let streakEmoji = "🔥";
+      
+      if (lastQuestDate === today) {
+        streakStatus = "Active today!";
+        streakEmoji = "✅";
+      } else if (lastQuestDate === yesterdayStr) {
+        streakStatus = "Complete a quest today to continue!";
+        streakEmoji = "⏰";
+      } else if (lastQuestDate === '') {
+        streakStatus = "Start your first quest!";
+        streakEmoji = "🚀";
+      } else {
+        streakStatus = "Streak broken - start a new one!";
+        streakEmoji = "💔";
+      }
+
+      // Build progress content
+      const progressContent = `📊 Your Quest Progress
+
+🏆 Total Points: ${user.total_points}
+✅ Quests Completed: ${user.quests_completed}
+${streakEmoji} Current Streak: ${user.current_streak} days
+📅 Last Quest: ${lastQuestDate || 'Never'}
+
+${streakStatus}
+
+Keep completing daily quests to maintain your streak!`;
+
+      // Use displayScrollingText for proper display
+      await this.displayScrollingText(
+        session,
+        "📊 Quest Progress",
+        progressContent
+      );
+
+      session.logger.info("Progress displayed", {
+        userId,
+        currentStreak: user.current_streak,
+        totalPoints: user.total_points,
+        questsCompleted: user.quests_completed,
+        lastQuestDate: user.last_quest_date
+      });
+    } catch (error) {
+      session.logger.error("Error showing progress", { error });
+      session.layouts.showTextWall(
+        "Error loading progress. Please try again.",
+        { durationMs: 3000 }
+      );
+    }
   }
 
   /**
